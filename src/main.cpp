@@ -1,6 +1,8 @@
 #include "inflect-nano.h"
 #include "utils.h"
+#include <cstdlib>
 #include <cstdio>
+#include <string>
 
 int main(int argc, char** argv) {
     using namespace inflect;
@@ -10,6 +12,12 @@ int main(int argc, char** argv) {
     std::string vocoder_path  = "inflect_vocoder.gguf";
     std::string cmudict_path  = "cmudict.bin";
     std::string output_path   = "output.wav";
+    int n_threads = -1;
+
+    if (const char* env = std::getenv("INFLECT_THREADS")) {
+        int parsed = std::atoi(env);
+        if (parsed > 0) n_threads = parsed;
+    }
 
     // Parse args (simplified)
     for (int i = 1; i < argc; i++) {
@@ -18,10 +26,13 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "-v" && i + 1 < argc) vocoder_path = argv[++i];
         if (std::string(argv[i]) == "-d" && i + 1 < argc) cmudict_path = argv[++i];
         if (std::string(argv[i]) == "-o" && i + 1 < argc) output_path = argv[++i];
+        if ((std::string(argv[i]) == "-j" || std::string(argv[i]) == "--threads") && i + 1 < argc) {
+            n_threads = std::atoi(argv[++i]);
+        }
     }
 
     // Init
-    Synthesizer::init_backend();
+    Synthesizer::init_backend(n_threads);
 
     Synthesizer synth;
     if (!synth.load_acoustic(acoustic_path)) {

@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     run(
         [
             sys.executable,
-            "convert.py",
+            "tools/convert.py",
             "--acoustic",
             str(acoustic_pt),
             "--vocoder",
@@ -281,6 +281,25 @@ def main(argv: list[str] | None = None) -> int:
                 cpp_dir / f"{name}.f32",
                 args.min_acoustic_cosine,
                 args.max_acoustic_mean_abs,
+            )
+        )
+
+    vocoder_names = ["vocoder_conv_pre"]
+    for i in range(4):
+        vocoder_names.append(f"vocoder_upsample_{i}")
+        for j in range(3):
+            vocoder_names.append(f"vocoder_resblock_{i}_{j}")
+        vocoder_names.append(f"vocoder_resblock_avg_{i}")
+    vocoder_names.extend(["vocoder_conv_post", "vocoder_tanh"])
+
+    for name in vocoder_names:
+        metrics.append(
+            compare_f32(
+                name,
+                py_dir / f"{name}.f32",
+                cpp_dir / f"{name}.f32",
+                args.min_audio_cosine,
+                args.max_audio_mean_abs,
             )
         )
 

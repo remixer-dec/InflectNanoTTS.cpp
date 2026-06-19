@@ -4,6 +4,11 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
+#include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <utility>
 
 namespace inflect {
 
@@ -27,6 +32,91 @@ static ggml_tensor* crop_time_3d(ggml_context* gctx, ggml_tensor* x, int left, i
     x = ggml_view_3d(gctx, x, out_t, x->ne[1], x->ne[2],
                      x->nb[1], x->nb[2], left * x->nb[0]);
     return ggml_cont(gctx, x);
+}
+
+static std::string debug_dump_dir() {
+    const char* dir = std::getenv("INFLECT_DUMP_DIR");
+    return (dir && dir[0]) ? std::string(dir) : std::string();
+}
+
+static void ensure_debug_dir(const std::string& dir) {
+    if (dir.empty()) return;
+    std::string cur;
+    for (char c : dir) {
+        cur.push_back(c);
+        if (c == '/' && cur.size() > 1) {
+            mkdir(cur.c_str(), 0755);
+        }
+    }
+    mkdir(dir.c_str(), 0755);
+}
+
+static std::string debug_path(const std::string& dir, const std::string& name) {
+    return dir + "/" + name;
+}
+
+static void debug_manifest(const std::string& dir, const std::string& line) {
+    if (dir.empty()) return;
+    std::ofstream f(debug_path(dir, "manifest.txt"), std::ios::app);
+    f << line << "\n";
+}
+
+static void debug_save_f32(const std::string& dir, const std::string& name,
+                           const std::vector<float>& data, const std::string& shape) {
+    if (dir.empty()) return;
+    std::ofstream f(debug_path(dir, name + ".f32"), std::ios::binary);
+    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
+    debug_manifest(dir, name + " f32 " + shape + " count=" + std::to_string(data.size()));
+}
+
+static std::vector<float> debug_transpose_time_channel(const std::vector<float>& data, int T, int C) {
+    std::vector<float> out(C * T);
+    for (int c = 0; c < C; c++) {
+        for (int t = 0; t < T; t++) {
+            out[c * T + t] = data[t + c * T];
+        }
+    }
+    return out;
+}
+
+static ggml_tensor* conv1d_vocoder(
+    ggml_context* gctx,
+    ggml_tensor* weight,
+    ggml_tensor* x,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation
+) {
+    if (!ggml_is_quantized(weight->type)) {
+        ggml_tensor* kernel = weight;
+        if (kernel->type != GGML_TYPE_F16) {
+            kernel = ggml_cast(gctx, kernel, GGML_TYPE_F16);
+        }
+        return ggml_conv_1d(gctx, kernel, x, stride, padding, dilation);
+    }
+
+    const int64_t in_ch = x->ne[1];
+    const int64_t out_ch = weight->ne[1];
+    const int64_t flat = kernel_size * in_ch;
+    if (weight->ne[0] < flat) {
+        fprintf(stderr, "[VocoderModel] quantized conv weight too small: weight=[%lld,%lld] flat=%lld\n",
+                (long long)weight->ne[0], (long long)weight->ne[1], (long long)flat);
+        std::abort();
+    }
+
+    // ggml_im2col only needs this tensor for shape/type; weights are consumed
+    // by the padded quantized matrix multiply below. Use F32 columns because
+    // this GGML CPU PAD op only supports F32.
+    ggml_tensor* shape_kernel = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, kernel_size, in_ch, out_ch);
+    ggml_tensor* im2col = ggml_im2col(gctx, shape_kernel, x, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor* cols = ggml_reshape_2d(gctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
+    if (weight->ne[0] > cols->ne[0]) {
+        cols = ggml_pad(gctx, cols, weight->ne[0] - cols->ne[0], 0, 0, 0);
+    }
+    ggml_tensor* y = ggml_mul_mat(gctx, weight, cols);
+    y = ggml_cont(gctx, ggml_transpose(gctx, y));
+    return ggml_reshape_3d(gctx, y, im2col->ne[1], out_ch, im2col->ne[2]);
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -243,14 +333,15 @@ ggml_tensor* VocoderModel::snake(
 ggml_tensor* VocoderModel::build_resblock(
     ggml_context* gctx,
     ggml_tensor* x,   // [T, ch, 1] — GGML conv1d input layout
-    const ResBlockWeights& w
+    const ResBlockWeights& w,
+    int kernel_size
 ) {
     // ResBlock1:
     //   for each (c1, c2, a1, a2) in zip(convs1, convs2, acts1, acts2):
     //     y = a1(x) → c1(y) → a2(y) → c2(y) → x = x + y
 
     for (int i = 0; i < 3; i++) {
-        int K = w.convs1_w[i]->ne[0]; // kernel size
+        int K = kernel_size;
         int dilation = config_.resblock_dilation_sizes[i % config_.resblock_dilation_sizes.size()][i];
         int pad1 = (K * dilation - dilation) / 2;
         int pad2 = (K - 1) / 2; // dilation=1 for convs2
@@ -258,13 +349,13 @@ ggml_tensor* VocoderModel::build_resblock(
         // a1(x)
         ggml_tensor* y = snake(gctx, x, w.acts1_alpha[i]);
         // c1(y) — dilated conv
-        y = ggml_conv_1d(gctx, w.convs1_w[i], y, 1, pad1, dilation);
+        y = conv1d_vocoder(gctx, w.convs1_w[i], y, K, 1, pad1, dilation);
         y = add_channel_bias(gctx, y, w.convs1_b[i]);
 
         // a2(y)
         y = snake(gctx, y, w.acts2_alpha[i]);
         // c2(y) — dilation=1 conv
-        y = ggml_conv_1d(gctx, w.convs2_w[i], y, 1, pad2, 1);
+        y = conv1d_vocoder(gctx, w.convs2_w[i], y, K, 1, pad2, 1);
         y = add_channel_bias(gctx, y, w.convs2_b[i]);
 
         // Residual
@@ -285,6 +376,17 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     const int n_ups = config_.upsample_rates.size();
     const int n_res = config_.resblock_kernel_sizes.size();
     const int init_ch = config_.upsample_initial_channel;
+    (void)init_ch;
+
+    const bool capture_debug = !debug_dump_dir().empty();
+    std::vector<ggml_tensor*> debug_outputs;
+    auto capture = [&](const std::string& name, ggml_tensor* t) {
+        if (!capture_debug) return;
+        ggml_tensor* out = ggml_cpy(gctx, t, ggml_dup_tensor(gctx, t));
+        ggml_set_name(out, name.c_str());
+        ggml_set_output(out);
+        debug_outputs.push_back(out);
+    };
 
     // ── Conv pre ────────────────────────────────────────────────────
     // GGML conv_1d expects input [T, in_ch, B] and weight [K, in_ch, out_ch]
@@ -292,8 +394,9 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     ggml_tensor* x = ggml_permute(gctx, mel, 1, 0, 2, 3); // [n_frames, n_mels, 1]
     x = ggml_cont(gctx, x);
 
-    x = ggml_conv_1d(gctx, weights_.conv_pre_w, x, 1, 3, 1); // k=7, pad=3
+    x = conv1d_vocoder(gctx, weights_.conv_pre_w, x, 7, 1, 3, 1);
     x = add_channel_bias(gctx, x, weights_.conv_pre_b);
+    capture("vocoder_conv_pre", x);
 
     // ── Upsampling + ResBlocks ──────────────────────────────────────
     for (int i = 0; i < n_ups; i++) {
@@ -309,12 +412,15 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
         // This GGML revision only supports p0=0 and d0=1 for conv_transpose_1d.
         x = ggml_conv_transpose_1d(gctx, weights_.ups_w[i], x, rate, 0, 1);
         x = crop_time_3d(gctx, x, pad, pad);
+        capture("vocoder_upsample_" + std::to_string(i), x);
 
         // Residual blocks (sum and average)
         ggml_tensor* xs = nullptr;
         for (int j = 0; j < n_res; j++) {
             int rb_idx = i * n_res + j;
-            ggml_tensor* rb_out = build_resblock(gctx, x, weights_.resblocks[rb_idx]);
+            int rb_kernel = config_.resblock_kernel_sizes[j];
+            ggml_tensor* rb_out = build_resblock(gctx, x, weights_.resblocks[rb_idx], rb_kernel);
+            capture("vocoder_resblock_" + std::to_string(i) + "_" + std::to_string(j), rb_out);
             if (j == 0) {
                 xs = rb_out;
             } else {
@@ -322,18 +428,25 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
             }
         }
         x = ggml_scale(gctx, xs, 1.0f / n_res);
+        capture("vocoder_resblock_avg_" + std::to_string(i), x);
     }
 
     // ── Post ────────────────────────────────────────────────────────
     x = snake(gctx, x, weights_.post_act_alpha);
-    x = ggml_conv_1d(gctx, weights_.conv_post_w, x, 1, 3, 1);
+    x = conv1d_vocoder(gctx, weights_.conv_post_w, x, 7, 1, 3, 1);
     x = add_channel_bias(gctx, x, weights_.conv_post_b);
+    capture("vocoder_conv_post", x);
     x = ggml_tanh(gctx, x);
+    capture("vocoder_tanh", x);
 
     // ── Build graph ─────────────────────────────────────────────────
     ggml_cgraph* graph = ggml_new_graph(gctx);
-    ggml_build_forward_expand(graph, x);
+    for (ggml_tensor* out : debug_outputs) {
+        ggml_build_forward_expand(graph, out);
+    }
     ggml_set_name(x, "audio");
+    ggml_set_output(x);
+    ggml_build_forward_expand(graph, x);
 
     return graph;
 }
@@ -374,6 +487,40 @@ std::vector<float> VocoderModel::vocode(
     ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[VocoderModel] Graph computation failed\n");
+    }
+
+    const std::string dump_dir = debug_dump_dir();
+    if (!dump_dir.empty()) {
+        ensure_debug_dir(dump_dir);
+        std::vector<std::string> dump_names = {"vocoder_conv_pre"};
+        for (int i = 0; i < (int)config_.upsample_rates.size(); i++) {
+            dump_names.push_back("vocoder_upsample_" + std::to_string(i));
+            for (int j = 0; j < (int)config_.resblock_kernel_sizes.size(); j++) {
+                dump_names.push_back("vocoder_resblock_" + std::to_string(i) + "_" + std::to_string(j));
+            }
+            dump_names.push_back("vocoder_resblock_avg_" + std::to_string(i));
+        }
+        dump_names.push_back("vocoder_conv_post");
+        dump_names.push_back("vocoder_tanh");
+
+        for (const std::string& name : dump_names) {
+            ggml_tensor* t = ggml_get_tensor(gctx, name.c_str());
+            if (!t) continue;
+            if (t->type != GGML_TYPE_F32 || t->ne[2] != 1) {
+                fprintf(stderr, "[VocoderModel] Skipping debug dump for non-F32 tensor %s\n", name.c_str());
+                continue;
+            }
+            const int T = (int)t->ne[0];
+            const int C = (int)t->ne[1];
+            std::vector<float> data(ggml_nelements(t));
+            ggml_backend_tensor_get(t, data.data(), 0, data.size() * sizeof(float));
+            debug_save_f32(
+                dump_dir,
+                name,
+                debug_transpose_time_channel(data, T, C),
+                "[" + std::to_string(C) + "," + std::to_string(T) + "]"
+            );
+        }
     }
 
     // Extract audio

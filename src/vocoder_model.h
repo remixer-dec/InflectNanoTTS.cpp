@@ -80,7 +80,8 @@ private:
     ggml_tensor* build_resblock(
         ggml_context* gctx,
         ggml_tensor* x,
-        const ResBlockWeights& w
+        const ResBlockWeights& w,
+        int kernel_size
     );
 
     ggml_cgraph* build_vocoder_graph(

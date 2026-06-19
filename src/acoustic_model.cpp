@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <random>
 #include <cstdlib>
+#include <vector>
 
 namespace inflect {
 
@@ -18,10 +19,49 @@ static void print_tensor_shape(const char* label, const ggml_tensor* t) {
 }
 
 static float tensor_get_f32(const ggml_tensor* t, int64_t i0, int64_t i1 = 0, int64_t i2 = 0) {
-    return *(const float*)((const char*)t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]);
+    const char* ptr = (const char*)t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2];
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            return *(const float*)ptr;
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(*(const ggml_fp16_t*)ptr);
+        default:
+            break;
+    }
+    if (ggml_is_quantized(t->type)) {
+        const auto* traits = ggml_get_type_traits(t->type);
+        if (!traits || !traits->to_float) {
+            fprintf(stderr, "[AcousticModel] unsupported quantized tensor read type %s for %s\n",
+                    ggml_type_name(t->type), t->name);
+            std::abort();
+        }
+
+        const char* row_ptr = (const char*)t->data + i1 * t->nb[1] + i2 * t->nb[2];
+        struct QuantRowCache {
+            const ggml_tensor* tensor = nullptr;
+            const char* row = nullptr;
+            std::vector<float> values;
+        };
+        thread_local QuantRowCache cache;
+        if (cache.tensor != t || cache.row != row_ptr || (int64_t)cache.values.size() != t->ne[0]) {
+            cache.tensor = t;
+            cache.row = row_ptr;
+            cache.values.resize(t->ne[0]);
+            traits->to_float(row_ptr, cache.values.data(), t->ne[0]);
+        }
+        return cache.values[i0];
+    }
+    fprintf(stderr, "[AcousticModel] unsupported direct tensor read type %s for %s\n",
+            ggml_type_name(t->type), t->name);
+    std::abort();
 }
 
 static void tensor_set_f32(ggml_tensor* t, float v, int64_t i0, int64_t i1, int64_t i2) {
+    if (t->type != GGML_TYPE_F32) {
+        fprintf(stderr, "[AcousticModel] unsupported direct tensor write type %s for %s\n",
+                ggml_type_name(t->type), t->name);
+        std::abort();
+    }
     *(float*)((char*)t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]) = v;
 }
 
@@ -76,6 +116,18 @@ static ggml_tensor* checked_add(ggml_context* ctx, ggml_tensor* a, ggml_tensor* 
     return ggml_add(ctx, a, b);
 }
 
+static ggml_tensor* trim_ne0(ggml_context* ctx, ggml_tensor* x, int64_t ne0) {
+    if (x->ne[0] == ne0) {
+        return x;
+    }
+    if (x->ne[0] < ne0 || x->ne[3] != 1) {
+        fprintf(stderr, "[AcousticModel] cannot trim tensor %s from ne0=%lld to %lld\n",
+                x->name, (long long)x->ne[0], (long long)ne0);
+        std::abort();
+    }
+    return ggml_view_3d(ctx, x, ne0, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // Layer helpers
 // ═════════════════════════════════════════════════════════════════════════
@@ -128,6 +180,12 @@ static ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x,
         // Converted Conv1d(kernel=1) weights are stored as [K, in, out].
         // Reinterpret the K=1 slice as the [in, out] matrix expected by GGML.
         mat_w = ggml_reshape_2d(ctx, w, w->ne[1], w->ne[2]);
+    }
+    if (mat_w->ne[0] > x->ne[0]) {
+        x = ggml_pad(ctx, x, mat_w->ne[0] - x->ne[0], 0, 0, 0);
+    }
+    if (x->ne[0] > mat_w->ne[0]) {
+        x = trim_ne0(ctx, x, mat_w->ne[0]);
     }
     if (mat_w->ne[0] != x->ne[0]) {
         fprintf(stderr, "[AcousticModel] linear shape mismatch\n");
@@ -405,15 +463,20 @@ ggml_cgraph* AcousticModel::build_encoder_graph(
     // ggml_get_rows returns [embedding_width, n_ids].
     ggml_tensor* phone_emb = ggml_get_rows(gctx, weights_.phone_emb, phone_ids); // [H, T]
     phone_emb = ggml_cont(gctx, phone_emb);
+    phone_emb = trim_ne0(gctx, phone_emb, H);
 
     ggml_tensor* tone_emb = ggml_get_rows(gctx, weights_.tone_emb, tone_ids);
     tone_emb = ggml_cont(gctx, tone_emb);
+    tone_emb = trim_ne0(gctx, tone_emb, H);
 
     ggml_tensor* lang_emb = ggml_get_rows(gctx, weights_.lang_emb, lang_ids);
     lang_emb = ggml_cont(gctx, lang_emb);
+    lang_emb = trim_ne0(gctx, lang_emb, H);
 
     // Speaker embedding
     ggml_tensor* spk_emb = ggml_get_rows(gctx, weights_.speaker_emb, speaker_ids); // [1, speaker_dim]
+    spk_emb = ggml_cont(gctx, spk_emb);
+    spk_emb = trim_ne0(gctx, spk_emb, config_.speaker_dim);
     spk_emb = linear(gctx, spk_emb, weights_.spk_proj_w, weights_.spk_proj_b);     // [H, 1]
     spk_emb = ggml_reshape_3d(gctx, spk_emb, H, 1, 1);                             // [H, 1, 1]
 

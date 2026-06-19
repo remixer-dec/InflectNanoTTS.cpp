@@ -40,6 +40,17 @@ def save_i32(out_dir: Path, name: str, tensor: torch.Tensor | np.ndarray, shape:
     save_manifest_line(out_dir, f"{name} i32 {shape} count={arr.size}")
 
 
+def save_vocoder_f32(out_dir: Path, name: str, tensor: torch.Tensor) -> None:
+    arr = tensor.detach().cpu()
+    if arr.ndim == 3:
+        arr = arr[0]
+    elif arr.ndim == 2:
+        pass
+    else:
+        raise ValueError(f"unexpected vocoder tensor shape for {name}: {tuple(arr.shape)}")
+    save_f32(out_dir, name, arr.contiguous(), f"[{arr.shape[0]},{arr.shape[1]}]")
+
+
 def normalize_audio(audio: np.ndarray, target_rms_db: float = -20.0, peak_db: float = -1.0) -> np.ndarray:
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
     if audio.size == 0:
@@ -140,7 +151,34 @@ def dump(args: argparse.Namespace) -> None:
     x = x + acoustic.frame_gru(x)[0]
     mel_base = acoustic.mel_head(x).transpose(1, 2)
     mel = mel_base + acoustic.cfg.postnet_scale * acoustic.postnet(mel_base)
-    audio_raw = vocoder(mel).squeeze().detach().cpu().numpy().astype(np.float32)
+    v = vocoder
+    vx = v.conv_pre(mel)
+    save_vocoder_f32(out_dir, "vocoder_conv_pre", vx)
+
+    ups = list(v.ups)
+    resblocks = list(v.resblocks)
+    n_res = len(resblocks) // max(1, len(ups))
+    for i, up in enumerate(ups):
+        vx = v.up_acts[i](vx)
+        vx = up(vx)
+        save_vocoder_f32(out_dir, f"vocoder_upsample_{i}", vx)
+
+        rb_sum = None
+        for j in range(n_res):
+            rb = resblocks[i * n_res + j]
+            rb_out = rb(vx)
+            save_vocoder_f32(out_dir, f"vocoder_resblock_{i}_{j}", rb_out)
+            rb_sum = rb_out if rb_sum is None else rb_sum + rb_out
+        vx = rb_sum / n_res
+        save_vocoder_f32(out_dir, f"vocoder_resblock_avg_{i}", vx)
+
+    vx = v.post_act(vx)
+    vx = v.conv_post(vx)
+    save_vocoder_f32(out_dir, "vocoder_conv_post", vx)
+    vx = torch.tanh(vx)
+    save_vocoder_f32(out_dir, "vocoder_tanh", vx)
+
+    audio_raw = vx.squeeze().detach().cpu().numpy().astype(np.float32)
     audio_norm = normalize_audio(audio_raw)
 
     t = int(phone.shape[1])
