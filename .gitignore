@@ -1,0 +1,25 @@
+.DS_Store
+STATUS.md
+
+# Build output
+/build/
+/cmake-build-*/
+/CMakeCache.txt
+/CMakeFiles/
+/compile_commands.json
+/Makefile
+
+# Local model and test artifacts
+/models/
+*.gguf
+*.pt
+*.bin
+*.wav
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor state
+.idea/
+.vscode/
