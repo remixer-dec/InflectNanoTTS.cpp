@@ -8,6 +8,10 @@
 #include <fstream>
 #include <string>
 
+#if defined(__linux__)
+#include <malloc.h>
+#endif
+
 #if defined(__APPLE__) && defined(__MACH__)
 #include <mach/mach.h>
 #endif
@@ -54,6 +58,12 @@ inline void mem_trace_rss(const char* label) {
         std::fprintf(stderr, "[mem] %s rss=%zu KB (%.2f MB)\n",
                      label, rss_kb, rss_kb / 1024.0);
     }
+}
+
+inline void mem_release_to_os() {
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
 }
 
 inline void mem_trace_graph(const char* label, const ggml_context* gctx, ggml_gallocr_t allocr) {

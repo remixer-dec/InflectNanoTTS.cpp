@@ -720,7 +720,7 @@ EncoderOutput AcousticModel::run_encoder(
     const int H = config_.hidden;
 
     // Create graph context
-    size_t gctx_size = 2 * 1024 * 1024;
+    size_t gctx_size = 512 * 1024;
     struct ggml_init_params gparams = {
         .mem_size   = gctx_size,
         .mem_buffer = nullptr,
@@ -968,37 +968,46 @@ std::vector<float> AcousticModel::run_decoder(
     const int n_mels = config_.n_mels;
 
     // Create graph context + input tensor
-    size_t gctx_size = 2 * 1024 * 1024;
+    size_t gctx_size = 512 * 1024;
     struct ggml_init_params gparams = {
         .mem_size   = gctx_size,
         .mem_buffer = nullptr,
         .no_alloc   = true,
     };
     ggml_context* gctx = ggml_init(gparams);
+    mem_trace_rss("decoder ctx init");
 
     // Create FEATURES input tensor
     ggml_tensor* features_t = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, H, features.n_frames, 1);
     ggml_set_input(features_t);
+    mem_trace_rss("decoder input tensor");
 
     // Build graph
     GruOpData gru_data{};
     quant_conv1d_ops_.clear();
     quant_conv1d_ops_.reserve(3);
     ggml_cgraph* graph = build_decoder_graph(gctx, features_t, &gru_data);
+    mem_trace_rss("decoder graph built");
 
     // Allocate
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_alloc_graph(allocr, graph);
     mem_trace_graph("decoder", gctx, allocr);
+    mem_trace_rss("decoder allocated");
 
     // Set input
     ggml_backend_tensor_set(features_t, features.features.data(), 0, features.features.size() * sizeof(float));
+#if defined(INFLECT_LOW_MEMORY)
+    mem_release_to_os();
+#endif
+    mem_trace_rss("decoder input copied");
 
     // Compute
     ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[AcousticModel] Decoder graph compute failed\n");
     }
+    mem_trace_rss("decoder computed");
 
     // Extract mel
     ggml_tensor* mel_t = ggml_get_tensor(gctx, "mel");
@@ -1011,9 +1020,18 @@ std::vector<float> AcousticModel::run_decoder(
 
     std::vector<float> mel(ggml_nelements(mel_t));
     ggml_backend_tensor_get(mel_t, mel.data(), 0, ggml_nbytes(mel_t));
+    mem_trace_rss("decoder mel copied");
 
     ggml_gallocr_free(allocr);
+#if defined(INFLECT_LOW_MEMORY)
+    mem_release_to_os();
+#endif
+    mem_trace_rss("decoder allocator freed");
     ggml_free(gctx);
+#if defined(INFLECT_LOW_MEMORY)
+    mem_release_to_os();
+#endif
+    mem_trace_rss("decoder context freed");
 
     return mel;
 }
@@ -1135,6 +1153,40 @@ bool AcousticModel::load(ModelLoader& loader) {
     weights_.mel_l2_b   = loader.get_tensor("mel_head.3.bias");
 
     // Postnet
+    weights_.post0_w = loader.get_tensor("postnet.0.weight");
+    weights_.post0_b = loader.get_tensor("postnet.0.bias");
+    weights_.post2_w = loader.get_tensor("postnet.2.weight");
+    weights_.post2_b = loader.get_tensor("postnet.2.bias");
+    weights_.post4_w = loader.get_tensor("postnet.4.weight");
+    weights_.post4_b = loader.get_tensor("postnet.4.bias");
+
+    wctx_ = loader.ctx();
+    return true;
+}
+
+bool AcousticModel::load_decoder(ModelLoader& loader) {
+    for (int i = 0; i < config_.decoder_layers; i++) {
+        ConvBlockWeights blk;
+        load_conv_block(loader, blk, "decoder." + std::to_string(i));
+        weights_.dec_blocks.push_back(blk);
+    }
+
+    weights_.gru_w_ih   = loader.get_tensor("frame_gru.weight_ih_l0");
+    weights_.gru_w_hh   = loader.get_tensor("frame_gru.weight_hh_l0");
+    weights_.gru_b_ih   = loader.get_tensor("frame_gru.bias_ih_l0");
+    weights_.gru_b_hh   = loader.get_tensor("frame_gru.bias_hh_l0");
+    weights_.gru_w_ih_r = loader.get_tensor("frame_gru.weight_ih_l0_reverse");
+    weights_.gru_w_hh_r = loader.get_tensor("frame_gru.weight_hh_l0_reverse");
+    weights_.gru_b_ih_r = loader.get_tensor("frame_gru.bias_ih_l0_reverse");
+    weights_.gru_b_hh_r = loader.get_tensor("frame_gru.bias_hh_l0_reverse");
+
+    weights_.mel_norm_w = loader.get_tensor("mel_head.0.weight");
+    weights_.mel_norm_b = loader.get_tensor("mel_head.0.bias");
+    weights_.mel_l1_w   = loader.get_tensor("mel_head.1.weight");
+    weights_.mel_l1_b   = loader.get_tensor("mel_head.1.bias");
+    weights_.mel_l2_w   = loader.get_tensor("mel_head.3.weight");
+    weights_.mel_l2_b   = loader.get_tensor("mel_head.3.bias");
+
     weights_.post0_w = loader.get_tensor("postnet.0.weight");
     weights_.post0_b = loader.get_tensor("postnet.0.bias");
     weights_.post2_w = loader.get_tensor("postnet.2.weight");

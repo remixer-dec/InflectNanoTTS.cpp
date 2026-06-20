@@ -61,6 +61,8 @@ private:
     std::unique_ptr<TextFrontend>  frontend_;
     std::unique_ptr<ModelLoader>   acoustic_loader_;
     std::unique_ptr<ModelLoader>   vocoder_loader_;
+    std::string acoustic_path_;
+    AcousticConfig acoustic_config_;
     std::string deferred_vocoder_path_;
     bool load_vocoder_now(const std::string& path);
 };

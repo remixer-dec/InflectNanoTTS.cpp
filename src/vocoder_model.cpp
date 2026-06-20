@@ -64,6 +64,65 @@ static void tensor_set_f32(ggml_tensor* t, float v, int64_t i0, int64_t i1, int6
     *(float*)((char*)t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]) = v;
 }
 
+static void quant_conv1d_op(
+    ggml_tensor* dst,
+    int ith,
+    int nth,
+    void* userdata
+) {
+    const auto* p = static_cast<const VocoderQuantConv1dOpData*>(userdata);
+    const ggml_tensor* x = dst->src[0];      // [T, in_ch, B]
+    const ggml_tensor* weight = dst->src[1]; // [K*in_ch padded, out_ch]
+    if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_quantized(weight->type)) {
+        fprintf(stderr, "[VocoderModel] unsupported low-memory conv1d tensor types\n");
+        std::abort();
+    }
+
+    const int64_t T = dst->ne[0];
+    const int64_t out_ch = dst->ne[1];
+    const int64_t batch = dst->ne[2];
+    const int64_t in_ch = x->ne[1];
+
+    const auto* traits = ggml_get_type_traits(weight->type);
+    if (!traits || !traits->to_float) {
+        fprintf(stderr, "[VocoderModel] unsupported quantized conv1d weight type %s\n",
+                ggml_type_name(weight->type));
+        std::abort();
+    }
+
+    thread_local std::vector<float> weight_row;
+    weight_row.resize(weight->ne[0]);
+
+    const char* x_data = static_cast<const char*>(x->data);
+    char* dst_data = static_cast<char*>(dst->data);
+
+    const int64_t o_start = (out_ch * ith) / nth;
+    const int64_t o_end = (out_ch * (ith + 1)) / nth;
+    for (int64_t o = o_start; o < o_end; o++) {
+        const char* row_ptr = static_cast<const char*>(weight->data) + o * weight->nb[1];
+        traits->to_float(row_ptr, weight_row.data(), weight->ne[0]);
+
+        for (int64_t b = 0; b < batch; b++) {
+            for (int64_t t = 0; t < T; t++) {
+                float v = 0.0f;
+                for (int64_t k = 0; k < p->kernel_size; k++) {
+                    const int64_t src_t = t * p->stride + k * p->dilation - p->padding;
+                    if (src_t < 0 || src_t >= x->ne[0]) {
+                        continue;
+                    }
+                    for (int64_t i = 0; i < in_ch; i++) {
+                        const int64_t flat = i * p->kernel_size + k;
+                        const float xv = *reinterpret_cast<const float*>(
+                            x_data + src_t * x->nb[0] + i * x->nb[1] + b * x->nb[2]);
+                        v += xv * weight_row[flat];
+                    }
+                }
+                *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
+            }
+        }
+    }
+}
+
 static ggml_tensor* add_channel_bias(ggml_context* gctx, ggml_tensor* x, ggml_tensor* bias) {
     ggml_tensor* b = channel_param_3d(gctx, bias);
     if (b->type != x->type && !ggml_is_quantized(b->type)) {
@@ -107,6 +166,44 @@ static std::string debug_path(const std::string& dir, const std::string& name) {
     return dir + "/" + name;
 }
 
+static void mem_trace_top_graph_tensors(const char* label, ggml_cgraph* graph, int limit = 16) {
+    if (!mem_trace_enabled()) return;
+    const char* detail = std::getenv("INFLECT_MEM_TRACE_DETAIL");
+    if (!detail || detail[0] != '1') return;
+
+    struct Entry {
+        size_t bytes;
+        ggml_tensor* tensor;
+    };
+    std::vector<Entry> entries;
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    entries.reserve(n_nodes);
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor* node = ggml_graph_node(graph, i);
+        entries.push_back({ggml_nbytes(node), node});
+    }
+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        return a.bytes > b.bytes;
+    });
+
+    const int n = std::min(limit, (int)entries.size());
+    fprintf(stderr, "[mem] %s largest graph tensors:\n", label);
+    for (int i = 0; i < n; i++) {
+        const ggml_tensor* t = entries[i].tensor;
+        const char* name = t->name[0] ? t->name : "(unnamed)";
+        fprintf(stderr,
+                "[mem]   %2d %8zu bytes %-12s %-24s shape=[%lld,%lld,%lld,%lld]\n",
+                i + 1,
+                entries[i].bytes,
+                ggml_op_name(t->op),
+                name,
+                (long long)t->ne[0],
+                (long long)t->ne[1],
+                (long long)t->ne[2],
+                (long long)t->ne[3]);
+    }
+}
+
 static void debug_manifest(const std::string& dir, const std::string& line) {
     if (dir.empty()) return;
     std::ofstream f(debug_path(dir, "manifest.txt"), std::ios::app);
@@ -138,7 +235,8 @@ static ggml_tensor* conv1d_vocoder(
     int kernel_size,
     int stride,
     int padding,
-    int dilation
+    int dilation,
+    std::vector<VocoderQuantConv1dOpData>& op_data
 ) {
     if (!ggml_is_quantized(weight->type)) {
         ggml_tensor* kernel = weight;
@@ -157,6 +255,13 @@ static ggml_tensor* conv1d_vocoder(
         std::abort();
     }
 
+#if defined(INFLECT_LOW_MEMORY)
+    const int64_t out_t = (x->ne[0] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    op_data.push_back({kernel_size, stride, padding, dilation});
+    ggml_tensor* args[] = {x, weight};
+    return ggml_custom_4d(gctx, GGML_TYPE_F32, out_t, out_ch, x->ne[2], 1,
+                          args, 2, quant_conv1d_op, GGML_N_TASKS_MAX, &op_data.back());
+#else
     // ggml_im2col only needs this tensor for shape/type; weights are consumed
     // by the padded quantized matrix multiply below. Use F32 columns because
     // this GGML CPU PAD op only supports F32.
@@ -169,6 +274,7 @@ static ggml_tensor* conv1d_vocoder(
     ggml_tensor* y = ggml_mul_mat(gctx, weight, cols);
     y = ggml_cont(gctx, ggml_transpose(gctx, y));
     return ggml_reshape_3d(gctx, y, im2col->ne[1], out_ch, im2col->ne[2]);
+#endif
 }
 
 static void quant_conv_transpose1d_op(
@@ -180,38 +286,58 @@ static void quant_conv_transpose1d_op(
     const auto* p = static_cast<const QuantConvTranspose1dOpData*>(userdata);
     const ggml_tensor* x = dst->src[0];      // [T_in, in_ch, B]
     const ggml_tensor* weight = dst->src[1]; // [K*in_ch padded, out_ch]
+    if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_quantized(weight->type)) {
+        fprintf(stderr, "[VocoderModel] unsupported low-memory conv_transpose1d tensor types\n");
+        std::abort();
+    }
 
     const int64_t out_t = dst->ne[0];
     const int64_t out_ch = dst->ne[1];
     const int64_t batch = dst->ne[2];
     const int64_t in_t = x->ne[0];
     const int64_t in_ch = x->ne[1];
-    const int64_t total = out_t * out_ch * batch;
-    const int64_t start = (total * ith) / nth;
-    const int64_t end = (total * (ith + 1)) / nth;
 
-    for (int64_t idx = start; idx < end; idx++) {
-        const int64_t t = idx % out_t;
-        const int64_t o = (idx / out_t) % out_ch;
-        const int64_t b = idx / (out_t * out_ch);
-        float v = 0.0f;
+    const auto* traits = ggml_get_type_traits(weight->type);
+    if (!traits || !traits->to_float) {
+        fprintf(stderr, "[VocoderModel] unsupported quantized conv_transpose1d weight type %s\n",
+                ggml_type_name(weight->type));
+        std::abort();
+    }
 
-        for (int64_t k = 0; k < p->kernel_size; k++) {
-            const int64_t rem = t - k;
-            if (rem < 0 || rem % p->stride != 0) {
-                continue;
-            }
-            const int64_t src_t = rem / p->stride;
-            if (src_t < 0 || src_t >= in_t) {
-                continue;
-            }
-            for (int64_t i = 0; i < in_ch; i++) {
-                const int64_t flat = k * in_ch + i;
-                v += tensor_get_f32(x, src_t, i, b) * tensor_get_f32(weight, flat, o, 0);
+    thread_local std::vector<float> weight_row;
+    weight_row.resize(weight->ne[0]);
+
+    const char* x_data = static_cast<const char*>(x->data);
+    char* dst_data = static_cast<char*>(dst->data);
+
+    const int64_t o_start = (out_ch * ith) / nth;
+    const int64_t o_end = (out_ch * (ith + 1)) / nth;
+    for (int64_t o = o_start; o < o_end; o++) {
+        const char* row_ptr = static_cast<const char*>(weight->data) + o * weight->nb[1];
+        traits->to_float(row_ptr, weight_row.data(), weight->ne[0]);
+
+        for (int64_t b = 0; b < batch; b++) {
+            for (int64_t t = 0; t < out_t; t++) {
+                float v = 0.0f;
+                for (int64_t k = 0; k < p->kernel_size; k++) {
+                    const int64_t rem = t - k;
+                    if (rem < 0 || rem % p->stride != 0) {
+                        continue;
+                    }
+                    const int64_t src_t = rem / p->stride;
+                    if (src_t < 0 || src_t >= in_t) {
+                        continue;
+                    }
+                    for (int64_t i = 0; i < in_ch; i++) {
+                        const int64_t flat = k * in_ch + i;
+                        const float xv = *reinterpret_cast<const float*>(
+                            x_data + src_t * x->nb[0] + i * x->nb[1] + b * x->nb[2]);
+                        v += xv * weight_row[flat];
+                    }
+                }
+                *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
             }
         }
-
-        tensor_set_f32(dst, v, t, o, b);
     }
 }
 
@@ -477,13 +603,13 @@ ggml_tensor* VocoderModel::build_resblock(
         // a1(x)
         ggml_tensor* y = snake(gctx, x, w.acts1_alpha[i]);
         // c1(y) — dilated conv
-        y = conv1d_vocoder(gctx, w.convs1_w[i], y, K, 1, pad1, dilation);
+        y = conv1d_vocoder(gctx, w.convs1_w[i], y, K, 1, pad1, dilation, quant_conv1d_ops_);
         y = add_channel_bias(gctx, y, w.convs1_b[i]);
 
         // a2(y)
         y = snake(gctx, y, w.acts2_alpha[i]);
         // c2(y) — dilation=1 conv
-        y = conv1d_vocoder(gctx, w.convs2_w[i], y, K, 1, pad2, 1);
+        y = conv1d_vocoder(gctx, w.convs2_w[i], y, K, 1, pad2, 1, quant_conv1d_ops_);
         y = add_channel_bias(gctx, y, w.convs2_b[i]);
 
         // Residual
@@ -522,7 +648,7 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     ggml_tensor* x = ggml_permute(gctx, mel, 1, 0, 2, 3); // [n_frames, n_mels, 1]
     x = ggml_cont(gctx, x);
 
-    x = conv1d_vocoder(gctx, weights_.conv_pre_w, x, 7, 1, 3, 1);
+    x = conv1d_vocoder(gctx, weights_.conv_pre_w, x, 7, 1, 3, 1, quant_conv1d_ops_);
     x = add_channel_bias(gctx, x, weights_.conv_pre_b);
     capture("vocoder_conv_pre", x);
 
@@ -561,7 +687,7 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
 
     // ── Post ────────────────────────────────────────────────────────
     x = snake(gctx, x, weights_.post_act_alpha);
-    x = conv1d_vocoder(gctx, weights_.conv_post_w, x, 7, 1, 3, 1);
+    x = conv1d_vocoder(gctx, weights_.conv_post_w, x, 7, 1, 3, 1, quant_conv1d_ops_);
     x = add_channel_bias(gctx, x, weights_.conv_post_b);
     capture("vocoder_conv_post", x);
     x = ggml_tanh(gctx, x);
@@ -590,35 +716,47 @@ std::vector<float> VocoderModel::vocode(
     ggml_backend_t backend
 ) {
     // Create graph context
-    size_t gctx_size = 4 * 1024 * 1024;
+    size_t gctx_size = 1024 * 1024;
     struct ggml_init_params gparams = {
         .mem_size   = gctx_size,
         .mem_buffer = nullptr,
         .no_alloc   = true,
     };
     ggml_context* gctx = ggml_init(gparams);
+    mem_trace_rss("vocoder ctx init");
 
     // Create input tensor
     ggml_tensor* mel_t = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, n_mels, n_frames, 1);
 
     // Build graph
+    quant_conv1d_ops_.clear();
+    size_t n_conv1d_ops = 2; // pre + post
+    for (const auto& dilations : config_.resblock_dilation_sizes) {
+        n_conv1d_ops += config_.upsample_rates.size() * dilations.size() * 2;
+    }
+    quant_conv1d_ops_.reserve(n_conv1d_ops);
     quant_conv_transpose_ops_.clear();
     quant_conv_transpose_ops_.reserve(config_.upsample_rates.size());
     ggml_cgraph* graph = build_vocoder_graph(gctx, mel_t);
+    mem_trace_rss("vocoder graph built");
 
     // Allocate
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_alloc_graph(allocr, graph);
     mem_trace_graph("vocoder", gctx, allocr);
+    mem_trace_top_graph_tensors("vocoder", graph);
+    mem_trace_rss("vocoder allocated");
 
     // Set input
     ggml_backend_tensor_set(mel_t, mel.data(), 0, n_mels * n_frames * sizeof(float));
+    mem_trace_rss("vocoder input copied");
 
     // Compute
     ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[VocoderModel] Graph computation failed\n");
     }
+    mem_trace_rss("vocoder computed");
 
     const std::string dump_dir = debug_dump_dir();
     if (!dump_dir.empty()) {
@@ -662,10 +800,15 @@ std::vector<float> VocoderModel::vocode(
     }
     std::vector<float> audio(ggml_nelements(audio_t));
     ggml_backend_tensor_get(audio_t, audio.data(), 0, ggml_nbytes(audio_t));
+    mem_trace_rss("vocoder audio copied");
 
     // Cleanup
     ggml_gallocr_free(allocr);
+    mem_release_to_os();
+    mem_trace_rss("vocoder allocator freed");
     ggml_free(gctx);
+    mem_release_to_os();
+    mem_trace_rss("vocoder context freed");
 
     return audio;
 }
@@ -715,6 +858,8 @@ void VocoderModel::vocode_streaming(
     std::vector<float> mel_chunk;
     mel_chunk.reserve(n_mels * chunk_frames);
     std::vector<float> audio_chunk;
+    std::vector<float> pending_tail;
+    std::vector<float> blended;
 
     for (int start = 0; start < n_frames; start += hop) {
         int end = std::min(start + chunk_frames, n_frames);
@@ -738,7 +883,29 @@ void VocoderModel::vocode_streaming(
         int out_end = audio_chunk.size() - discard_end;
 
         if (out_end > out_start) {
-            callback(audio_chunk.data() + out_start, out_end - out_start);
+            const int out_len = out_end - out_start;
+            int blended_len = 0;
+            if (!pending_tail.empty()) {
+                blended_len = std::min<int>(pending_tail.size(), out_len);
+                blended.resize(blended_len);
+                for (int i = 0; i < blended_len; i++) {
+                    const float t = (float)(i + 1) / (float)(blended_len + 1);
+                    blended[i] = pending_tail[i] * (1.0f - t) + audio_chunk[out_start + i] * t;
+                }
+                callback(blended.data(), blended.size());
+            }
+            if (out_len > blended_len) {
+                callback(audio_chunk.data() + out_start + blended_len, out_len - blended_len);
+            }
+        } else if (!pending_tail.empty() && end >= n_frames) {
+            callback(pending_tail.data(), pending_tail.size());
+            pending_tail.clear();
+        }
+
+        if (discard_end > 0) {
+            pending_tail.assign(audio_chunk.begin() + out_end, audio_chunk.end());
+        } else {
+            pending_tail.clear();
         }
         if (end >= n_frames) {
             break;

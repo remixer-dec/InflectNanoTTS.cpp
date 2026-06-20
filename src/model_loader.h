@@ -19,6 +19,7 @@ public:
 
     // Load GGUF file, allocate backend buffer for weights
     bool load(const std::string& path);
+    bool load_selected(const std::string& path, const std::vector<std::string>& prefixes);
 
     // ── Tensor access ──────────────────────────────────────────────
     ggml_tensor* get_tensor(const std::string& name) const;

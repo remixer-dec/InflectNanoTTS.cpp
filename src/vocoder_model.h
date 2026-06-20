@@ -35,6 +35,13 @@ struct QuantConvTranspose1dOpData {
     int stride;
 };
 
+struct VocoderQuantConv1dOpData {
+    int kernel_size;
+    int stride;
+    int padding;
+    int dilation;
+};
+
 class VocoderModel {
 public:
     explicit VocoderModel(const VocoderConfig& config);
@@ -65,6 +72,7 @@ private:
     VocoderConfig config_;
     VocoderWeights weights_;
     ggml_context* wctx_ = nullptr; // Non-owning; ModelLoader owns the context.
+    std::vector<VocoderQuantConv1dOpData> quant_conv1d_ops_;
     std::vector<QuantConvTranspose1dOpData> quant_conv_transpose_ops_;
 
     void fold_weight_norm(

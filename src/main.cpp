@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
     }
 #if defined(INFLECT_LOW_MEMORY)
     if (vocoder_chunk_frames <= 0) {
-        vocoder_chunk_frames = 16;
+        vocoder_chunk_frames = 11;
     }
 #endif
 

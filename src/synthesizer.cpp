@@ -101,6 +101,7 @@ Synthesizer::Synthesizer() {
 Synthesizer::~Synthesizer() = default;
 
 bool Synthesizer::load_acoustic(const std::string& path) {
+    acoustic_path_ = path;
     acoustic_loader_ = std::make_unique<ModelLoader>();
     if (!acoustic_loader_->load(path)) return false;
 
@@ -121,6 +122,7 @@ bool Synthesizer::load_acoustic(const std::string& path) {
     cfg.sample_rate    = acoustic_loader_->get_i32("sample_rate", 24000);
     cfg.max_frames     = acoustic_loader_->get_i32("max_frames", 1400);
     cfg.postnet_scale  = acoustic_loader_->get_f32("postnet_scale", 0.1f);
+    acoustic_config_ = cfg;
 
     acoustic_ = std::make_unique<AcousticModel>(cfg);
     const bool ok = acoustic_->load(*acoustic_loader_);
@@ -229,6 +231,9 @@ void Synthesizer::synthesize_streaming(
         tokens.phone_ids, tokens.tone_ids, tokens.lang_ids,
         params.speaker_id, g_backend
     );
+#if defined(INFLECT_LOW_MEMORY)
+    mem_release_to_os();
+#endif
     mem_trace_rss("after encoder");
 
     fprintf(stderr, "[Synthesizer] Encoder done: %d frames predicted\n",
@@ -260,6 +265,9 @@ void Synthesizer::synthesize_streaming(
     auto features = acoustic_->length_regulate(
         enc_out, params.length_scale, params.pitch_scale, params.energy_scale
     );
+#if defined(INFLECT_LOW_MEMORY)
+    mem_release_to_os();
+#endif
     mem_trace_rss("after length regulation");
 
     fprintf(stderr, "[Synthesizer] Length regulated: %d frames\n",
@@ -272,6 +280,26 @@ void Synthesizer::synthesize_streaming(
                        "[" + std::to_string(features.hidden) + "," + std::to_string(features.n_frames) + "]");
     }
 
+#if defined(INFLECT_LOW_MEMORY)
+    enc_out = EncoderOutput{};
+    acoustic_.reset();
+    acoustic_loader_.reset();
+    mem_release_to_os();
+    mem_trace_rss("after acoustic encoder release");
+
+    acoustic_loader_ = std::make_unique<ModelLoader>();
+    if (!acoustic_loader_->load_selected(acoustic_path_, {"decoder.", "frame_gru.", "mel_head.", "postnet."})) {
+        fprintf(stderr, "[Synthesizer] Failed to reload decoder-only acoustic model\n");
+        return;
+    }
+    acoustic_ = std::make_unique<AcousticModel>(acoustic_config_);
+    if (!acoustic_->load_decoder(*acoustic_loader_)) {
+        fprintf(stderr, "[Synthesizer] Failed to bind decoder-only acoustic model\n");
+        return;
+    }
+    mem_trace_rss("after acoustic decoder reload");
+#endif
+
     // ── 4. Graph 2: Decoder → Mel ───────────────────────────────────
     auto mel = acoustic_->run_decoder(features, g_backend);
     mem_trace_rss("after decoder");
@@ -279,10 +307,10 @@ void Synthesizer::synthesize_streaming(
     int n_frames = features.n_frames;
 
 #if defined(INFLECT_LOW_MEMORY)
-    enc_out = EncoderOutput{};
     features = RegulatedFeatures{};
     acoustic_.reset();
     acoustic_loader_.reset();
+    mem_release_to_os();
     mem_trace_rss("after acoustic release");
     if (!vocoder_ && !deferred_vocoder_path_.empty()) {
         if (!load_vocoder_now(deferred_vocoder_path_)) {

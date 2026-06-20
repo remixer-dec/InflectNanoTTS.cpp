@@ -129,6 +129,7 @@ public:
     ~AcousticModel();
 
     bool load(ModelLoader& loader);
+    bool load_decoder(ModelLoader& loader);
 
     // Graph 1: Encoder + prediction heads
     EncoderOutput run_encoder(

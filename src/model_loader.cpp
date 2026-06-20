@@ -1,4 +1,5 @@
 #include "model_loader.h"
+#include "memory_trace.h"
 #include <ggml-cpu.h>
 #include <algorithm>
 #include <cstdio>
@@ -13,7 +14,27 @@ ModelLoader::~ModelLoader() {
     if (gguf_)   gguf_free(gguf_);
 }
 
+static bool selected_tensor(const char* name, const std::vector<std::string>* prefixes) {
+    if (!prefixes) return true;
+    for (const std::string& prefix : *prefixes) {
+        if (std::strncmp(name, prefix.c_str(), prefix.size()) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t align_up(size_t value, size_t align) {
+    return align > 1 ? ((value + align - 1) / align) * align : value;
+}
+
 bool ModelLoader::load(const std::string& path) {
+    return load_selected(path, {});
+}
+
+bool ModelLoader::load_selected(const std::string& path, const std::vector<std::string>& prefixes) {
+    const std::vector<std::string>* selected_prefixes = prefixes.empty() ? nullptr : &prefixes;
+
     // ── 1. Open GGUF and let GGML create tensor metadata ───────────
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
@@ -24,6 +45,7 @@ bool ModelLoader::load(const std::string& path) {
         fprintf(stderr, "[ModelLoader] Failed to open GGUF: %s\n", path.c_str());
         return false;
     }
+    mem_trace_rss("loader gguf init");
 
     const int n_tensors = gguf_get_n_tensors(gguf_);
     if (!ctx_) {
@@ -41,11 +63,40 @@ bool ModelLoader::load(const std::string& path) {
         }
     }
 
-    // ── 3. Allocate CPU backend storage for all weight tensors ─────
-    buffer_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, ggml_backend_cpu_buffer_type());
+    // ── 3. Allocate CPU backend storage for selected weight tensors ─
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t total_alloc = 0;
+    int selected_count = 0;
+    for (int i = 0; i < n_tensors; i++) {
+        const char* name = gguf_get_tensor_name(gguf_, i);
+        if (!selected_tensor(name, selected_prefixes)) continue;
+        ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
+        total_alloc = align_up(total_alloc, alignment);
+        total_alloc += ggml_backend_buft_get_alloc_size(buft, tensor);
+        selected_count++;
+    }
+
+    buffer_ = ggml_backend_buft_alloc_buffer(buft, total_alloc);
     if (!buffer_) {
         fprintf(stderr, "[ModelLoader] Failed to allocate backend tensor buffer\n");
         return false;
+    }
+    ggml_backend_buffer_set_usage(buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    mem_trace_rss("loader buffer allocated");
+
+    char* base = static_cast<char*>(ggml_backend_buffer_get_base(buffer_));
+    size_t cursor = 0;
+    for (int i = 0; i < n_tensors; i++) {
+        const char* name = gguf_get_tensor_name(gguf_, i);
+        if (!selected_tensor(name, selected_prefixes)) continue;
+        ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
+        cursor = align_up(cursor, alignment);
+        if (ggml_backend_tensor_alloc(buffer_, tensor, base + cursor) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[ModelLoader] Failed to allocate tensor %s\n", name);
+            return false;
+        }
+        cursor += ggml_backend_buft_get_alloc_size(buft, tensor);
     }
 
     // ── 4. Load tensor data from GGUF into backend tensors ─────────
@@ -59,6 +110,7 @@ bool ModelLoader::load(const std::string& path) {
     std::vector<uint8_t> data(64 * 1024);
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(gguf_, i);
+        if (!selected_tensor(name, selected_prefixes)) continue;
         ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
 
         size_t offset = gguf_get_data_offset(gguf_) + gguf_get_tensor_offset(gguf_, i);
@@ -86,15 +138,17 @@ bool ModelLoader::load(const std::string& path) {
         }
     }
     fclose(f);
+    mem_release_to_os();
+    mem_trace_rss("loader tensors loaded");
 
-    fprintf(stderr, "[ModelLoader] Loaded %d tensors (%.2f MB) from %s\n",
-            n_tensors, total_size / 1024.0 / 1024.0, path.c_str());
+    fprintf(stderr, "[ModelLoader] Loaded %d/%d tensors (%.2f MB) from %s\n",
+            selected_count, n_tensors, total_size / 1024.0 / 1024.0, path.c_str());
     return true;
 }
 
 ggml_tensor* ModelLoader::get_tensor(const std::string& name) const {
     ggml_tensor* tensor = ctx_ ? ggml_get_tensor(ctx_, name.c_str()) : nullptr;
-    if (!tensor) {
+    if (!tensor || !tensor->data) {
         fprintf(stderr, "[ModelLoader] Tensor not found: %s\n", name.c_str());
         return nullptr;
     }
