@@ -3,10 +3,15 @@
 #include <cctype>
 #include <fstream>
 #include <sstream>
-#include <regex>
 #include <cstdlib>
+#include <cstring>
 
 namespace inflect {
+
+static bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::strcmp(value, "1") == 0;
+}
 
 static uint8_t remap_legacy_phone_id(uint8_t id) {
     // Older cmudict.bin files were built with an English-only symbol table.
@@ -20,6 +25,47 @@ static uint8_t remap_legacy_phone_id(uint8_t id) {
         208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218,
     };
     return id < sizeof(map) ? map[id] : id;
+}
+
+static bool starts_with_at(const std::string& s, size_t pos, const char* needle) {
+    const size_t n = std::strlen(needle);
+    return pos + n <= s.size() && std::memcmp(s.data() + pos, needle, n) == 0;
+}
+
+static bool cleanup_punctuation_at(const std::string& s, size_t pos, size_t& len) {
+    if (starts_with_at(s, pos, "\u2026")) {
+        len = std::strlen("\u2026");
+        return true;
+    }
+    const unsigned char c = static_cast<unsigned char>(s[pos]);
+    if (c == ',' || c == '.' || c == '!' || c == '?') {
+        len = 1;
+        return true;
+    }
+    return false;
+}
+
+static bool has_word_boundary_before(const std::string& s, size_t pos) {
+    if (pos == 0) {
+        return true;
+    }
+    const unsigned char prev = static_cast<unsigned char>(s[pos - 1]);
+    return !std::isalnum(prev) && prev != '_';
+}
+
+static bool ascii_iequals_at(const std::string& s, size_t pos, const char* needle) {
+    const size_t n = std::strlen(needle);
+    if (pos + n > s.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char a = static_cast<unsigned char>(s[pos + i]);
+        const unsigned char b = static_cast<unsigned char>(needle[i]);
+        if (std::tolower(a) != std::tolower(b)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Phoneme vocabulary (from symbols.py)
@@ -84,6 +130,34 @@ bool TextFrontend::load_cmudict(const std::string& path) {
         legacy_phone_ids = true;
     }
 
+    if (flash_dict_.is_open()) {
+        flash_dict_.close();
+    }
+    dict_path_ = path;
+    dict_count_ = count;
+    legacy_phone_ids_ = legacy_phone_ids;
+    flash_cmu_ = env_flag_enabled("INFLECT_FLASH_CMU");
+#if defined(INFLECT_LOW_MEMORY)
+    flash_cmu_ = true;
+#endif
+    if (flash_cmu_) {
+        if (!load_cmudict_sparse_index(f, count)) {
+            return false;
+        }
+        if (legacy_phone_ids_) {
+            fprintf(stderr, "[TextFrontend] Remapped legacy cmudict phone IDs to model vocabulary\n");
+        }
+        fprintf(stderr, "[TextFrontend] Loaded sparse index for %u dictionary entries\n", dict_count_);
+        return true;
+    }
+
+    dict_.clear();
+    dict_words_.clear();
+    dict_phones_.clear();
+    dict_.reserve(count);
+    dict_words_.reserve(count * 8);
+    dict_phones_.reserve(count * 6);
+
     for (uint32_t entry_idx = 0; entry_idx < count && f.good(); entry_idx++) {
         uint8_t word_len = 0;
         f.read(reinterpret_cast<char*>(&word_len), 1);
@@ -96,27 +170,146 @@ bool TextFrontend::load_cmudict(const std::string& path) {
         f.read(reinterpret_cast<char*>(&n_phones), 1);
 
         DictEntry entry;
-        entry.phonemes.resize(n_phones);
+        entry.word_offset = static_cast<uint32_t>(dict_words_.size());
+        entry.phone_offset = static_cast<uint32_t>(dict_phones_.size());
+        entry.word_len = word_len;
+        entry.phone_count = n_phones;
+        dict_words_.append(word);
         for (int i = 0; i < n_phones; i++) {
-            f.read(reinterpret_cast<char*>(&entry.phonemes[i].first), 1);  // phone_id
-            f.read(reinterpret_cast<char*>(&entry.phonemes[i].second), 1); // tone
+            uint8_t phone_id = 0;
+            uint8_t tone = 0;
+            f.read(reinterpret_cast<char*>(&phone_id), 1);
+            f.read(reinterpret_cast<char*>(&tone), 1);
+            if (legacy_phone_ids) {
+                phone_id = remap_legacy_phone_id(phone_id);
+            }
+            dict_phones_.push_back({phone_id, tone});
         }
 
-        dict_[word] = std::move(entry);
+        dict_.push_back(entry);
     }
 
     if (legacy_phone_ids) {
-        for (auto& [word, entry] : dict_) {
-            (void)word;
-            for (auto& [phone_id, tone] : entry.phonemes) {
-                phone_id = remap_legacy_phone_id(phone_id);
-            }
-        }
         fprintf(stderr, "[TextFrontend] Remapped legacy cmudict phone IDs to model vocabulary\n");
     }
-
     fprintf(stderr, "[TextFrontend] Loaded %zu dictionary entries\n", dict_.size());
     return true;
+}
+
+bool TextFrontend::load_cmudict_sparse_index(std::ifstream& f, uint32_t count) {
+    constexpr uint32_t kIndexStride = 256;
+    dict_.clear();
+    dict_words_.clear();
+    dict_phones_.clear();
+    sparse_index_.clear();
+    sparse_words_.clear();
+    sparse_index_.reserve(count / kIndexStride + 1);
+    sparse_words_.reserve((count / kIndexStride + 1) * 8);
+
+    for (uint32_t entry_idx = 0; entry_idx < count && f.good(); entry_idx++) {
+        const uint64_t entry_offset = static_cast<uint64_t>(f.tellg());
+        uint8_t word_len = 0;
+        f.read(reinterpret_cast<char*>(&word_len), 1);
+        if (f.gcount() < 1) break;
+
+        std::string word(word_len, '\0');
+        f.read(&word[0], word_len);
+
+        uint8_t n_phones = 0;
+        f.read(reinterpret_cast<char*>(&n_phones), 1);
+        f.seekg(static_cast<std::streamoff>(2 * n_phones), std::ios::cur);
+
+        if (entry_idx % kIndexStride == 0) {
+            SparseIndexEntry entry;
+            entry.word_offset = static_cast<uint32_t>(sparse_words_.size());
+            entry.word_len = word_len;
+            entry.offset = entry_offset;
+            entry.entry_index = entry_idx;
+            sparse_words_.append(word);
+            sparse_index_.push_back(entry);
+        }
+    }
+    flash_dict_.open(dict_path_, std::ios::binary);
+    return !sparse_index_.empty();
+}
+
+std::string_view TextFrontend::dict_word(const DictEntry& entry) const {
+    return std::string_view(dict_words_.data() + entry.word_offset, entry.word_len);
+}
+
+const TextFrontend::DictEntry* TextFrontend::find_dict_entry(std::string_view word) const {
+    auto it = std::lower_bound(
+        dict_.begin(), dict_.end(), word,
+        [&](const DictEntry& entry, std::string_view needle) {
+            return dict_word(entry) < needle;
+        }
+    );
+    if (it != dict_.end() && dict_word(*it) == word) {
+        return &*it;
+    }
+    return nullptr;
+}
+
+std::string_view TextFrontend::sparse_word(const SparseIndexEntry& entry) const {
+    return std::string_view(sparse_words_.data() + entry.word_offset, entry.word_len);
+}
+
+bool TextFrontend::lookup_flash_entry(
+    std::string_view word,
+    std::vector<PhoneTone>& phonemes
+) const {
+    if (sparse_index_.empty()) {
+        return false;
+    }
+
+    auto it = std::upper_bound(
+        sparse_index_.begin(), sparse_index_.end(), word,
+        [&](std::string_view needle, const SparseIndexEntry& entry) {
+            return needle < sparse_word(entry);
+        }
+    );
+    if (it != sparse_index_.begin()) {
+        --it;
+    }
+
+    if (!flash_dict_.is_open()) {
+        return false;
+    }
+    flash_dict_.clear();
+    flash_dict_.seekg(static_cast<std::streamoff>(it->offset), std::ios::beg);
+
+    const uint32_t end_index = std::min<uint32_t>(it->entry_index + 256, dict_count_);
+    for (uint32_t entry_idx = it->entry_index; entry_idx < end_index && flash_dict_.good(); entry_idx++) {
+        uint8_t word_len = 0;
+        flash_dict_.read(reinterpret_cast<char*>(&word_len), 1);
+        if (flash_dict_.gcount() < 1) break;
+
+        char entry_word[256];
+        flash_dict_.read(entry_word, word_len);
+
+        uint8_t n_phones = 0;
+        flash_dict_.read(reinterpret_cast<char*>(&n_phones), 1);
+
+        if (word_len == word.size() && std::memcmp(entry_word, word.data(), word_len) == 0) {
+            phonemes.clear();
+            phonemes.reserve(n_phones);
+            for (int i = 0; i < n_phones; i++) {
+                uint8_t phone_id = 0;
+                uint8_t tone = 0;
+                flash_dict_.read(reinterpret_cast<char*>(&phone_id), 1);
+                flash_dict_.read(reinterpret_cast<char*>(&tone), 1);
+                if (legacy_phone_ids_) {
+                    phone_id = remap_legacy_phone_id(phone_id);
+                }
+                phonemes.push_back({phone_id, tone});
+            }
+            return true;
+        }
+
+        flash_dict_.seekg(static_cast<std::streamoff>(2 * n_phones), std::ios::cur);
+    }
+
+    return false;
 }
 
 std::string TextFrontend::clean_text(const std::string& text) {
@@ -143,11 +336,46 @@ std::string TextFrontend::clean_text(const std::string& text) {
     replace("\n", ".");
     replace("...", "\u2026");
 
-    result = std::regex_replace(result, std::regex("\\s+"), " ");
-    result = std::regex_replace(result, std::regex("\\s+([,.!?…])"), "$1");
-    result = std::regex_replace(result, std::regex("([,.!?…]){2,}"), "$1");
+    std::string cleaned;
+    cleaned.reserve(result.size());
+    bool pending_space = false;
+    bool last_was_cleanup_punct = false;
+    size_t last_punct_pos = 0;
 
-    return result;
+    for (size_t i = 0; i < result.size();) {
+        const unsigned char c = static_cast<unsigned char>(result[i]);
+        if (std::isspace(c)) {
+            pending_space = true;
+            i++;
+            continue;
+        }
+
+        size_t punct_len = 0;
+        if (cleanup_punctuation_at(result, i, punct_len)) {
+            if (last_was_cleanup_punct) {
+                cleaned.erase(last_punct_pos);
+            }
+            if (!cleaned.empty() && cleaned.back() == ' ') {
+                cleaned.pop_back();
+            }
+            last_punct_pos = cleaned.size();
+            cleaned.append(result, i, punct_len);
+            last_was_cleanup_punct = true;
+            pending_space = false;
+            i += punct_len;
+            continue;
+        }
+
+        if (pending_space && !cleaned.empty()) {
+            cleaned.push_back(' ');
+        }
+        pending_space = false;
+        last_was_cleanup_punct = false;
+        cleaned.push_back(result[i]);
+        i++;
+    }
+
+    return cleaned;
 }
 
 std::string TextFrontend::normalize_text(const std::string& text) {
@@ -163,19 +391,30 @@ std::string TextFrontend::normalize_text(const std::string& text) {
 }
 
 std::string TextFrontend::expand_abbreviations(const std::string& text) {
-    // Match Python's abbreviation expansion: regex with word boundaries
     std::string result = text;
-    static const std::vector<std::pair<std::string, std::string>> abbrevs = {
-        {"mrs\\.", "misess"}, {"mr\\.", "mister"}, {"dr\\.", "doctor"},
-        {"st\\.", "saint"}, {"co\\.", "company"}, {"jr\\.", "junior"},
-        {"maj\\.", "major"}, {"gen\\.", "general"}, {"drs\\.", "doctors"},
-        {"rev\\.", "reverend"}, {"lt\\.", "lieutenant"}, {"hon\\.", "honorable"},
-        {"sgt\\.", "sergeant"}, {"capt\\.", "captain"}, {"esq\\.", "esquire"},
-        {"ltd\\.", "limited"}, {"col\\.", "colonel"}, {"ft\\.", "fort"},
+    struct Abbrev {
+        const char* pattern;
+        const char* expansion;
     };
-    for (const auto& [pattern, expansion] : abbrevs) {
-        std::regex re("\\b" + pattern, std::regex::icase);
-        result = std::regex_replace(result, re, expansion);
+    static constexpr Abbrev abbrevs[] = {
+        {"mrs.", "misess"}, {"mr.", "mister"}, {"dr.", "doctor"},
+        {"st.", "saint"}, {"co.", "company"}, {"jr.", "junior"},
+        {"maj.", "major"}, {"gen.", "general"}, {"drs.", "doctors"},
+        {"rev.", "reverend"}, {"lt.", "lieutenant"}, {"hon.", "honorable"},
+        {"sgt.", "sergeant"}, {"capt.", "captain"}, {"esq.", "esquire"},
+        {"ltd.", "limited"}, {"col.", "colonel"}, {"ft.", "fort"},
+    };
+    for (const auto& abbrev : abbrevs) {
+        const size_t pattern_len = std::strlen(abbrev.pattern);
+        for (size_t pos = 0; pos < result.size();) {
+            if (has_word_boundary_before(result, pos) &&
+                ascii_iequals_at(result, pos, abbrev.pattern)) {
+                result.replace(pos, pattern_len, abbrev.expansion);
+                pos += std::strlen(abbrev.expansion);
+            } else {
+                pos++;
+            }
+        }
     }
     return result;
 }
@@ -202,9 +441,18 @@ std::vector<std::pair<std::string, int>> TextFrontend::word_to_phonemes(
     std::transform(upper_word.begin(), upper_word.end(), upper_word.begin(),
                    [](unsigned char c) { return std::toupper(c); });
 
-    auto it = dict_.find(upper_word);
-    if (it != dict_.end()) {
-        for (const auto& [phone_id, tone] : it->second.phonemes) {
+    std::vector<PhoneTone> flash_phonemes;
+    if (flash_cmu_ && lookup_flash_entry(upper_word, flash_phonemes)) {
+        for (const auto& phone : flash_phonemes) {
+            result.push_back({"phone_" + std::to_string(phone.phone_id), phone.tone});
+        }
+        return result;
+    }
+
+    const DictEntry* entry = find_dict_entry(upper_word);
+    if (entry) {
+        for (int i = 0; i < entry->phone_count; i++) {
+            const auto& [phone_id, tone] = dict_phones_[entry->phone_offset + i];
             // Convert phone_id back to symbol (reverse lookup)
             // For now, return placeholder
             result.push_back({"phone_" + std::to_string(phone_id), tone});
@@ -214,6 +462,45 @@ std::vector<std::pair<std::string, int>> TextFrontend::word_to_phonemes(
 
     // OOV: spell out
     return spell_out(word);
+}
+
+std::vector<TextFrontend::PhoneTone> TextFrontend::word_to_phone_ids(
+    const std::string& word
+) {
+    std::vector<PhoneTone> result;
+
+    if (word.size() == 1) {
+        auto it = phoneme_vocab_.find(word);
+        if (it != phoneme_vocab_.end()) {
+            result.push_back({it->second, 0});
+            return result;
+        }
+    }
+
+    std::string upper_word = word;
+    std::transform(upper_word.begin(), upper_word.end(), upper_word.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+
+    if (flash_cmu_ && lookup_flash_entry(upper_word, result)) {
+        return result;
+    }
+
+    const DictEntry* entry = find_dict_entry(upper_word);
+    if (entry) {
+        result.reserve(entry->phone_count);
+        for (int i = 0; i < entry->phone_count; i++) {
+            const auto& [phone_id, tone] = dict_phones_[entry->phone_offset + i];
+            result.push_back({phone_id, tone});
+        }
+        return result;
+    }
+
+    auto spelled = spell_out(word);
+    result.reserve(spelled.size());
+    for (const auto& [phone, tone] : spelled) {
+        result.push_back({phoneme_to_id(phone), tone});
+    }
+    return result;
 }
 
 std::vector<std::pair<std::string, int>> TextFrontend::spell_out(
@@ -295,21 +582,21 @@ PhonemeResult TextFrontend::process(const std::string& text) {
 
     // 3. Tokenize and look up phonemes. Keep punctuation as model tokens
     // instead of attaching it to neighboring words.
-    std::vector<std::string> phones;
+    std::vector<int32_t> phone_ids;
     std::vector<int32_t> tones;
 
     // Add start token
-    phones.push_back("_");
+    phone_ids.push_back(0);
     tones.push_back(0);
 
     auto flush_word = [&](std::string& word) {
         if (word.empty()) {
             return;
         }
-        auto word_phones = word_to_phonemes(word);
-        for (const auto& [ph, tone] : word_phones) {
-            phones.push_back(ph);
-            tones.push_back(tone);
+        auto word_phones = word_to_phone_ids(word);
+        for (const auto& phone : word_phones) {
+            phone_ids.push_back(phone.phone_id);
+            tones.push_back(phone.tone);
         }
         word.clear();
     };
@@ -326,20 +613,18 @@ PhonemeResult TextFrontend::process(const std::string& text) {
             flush_word(word);
         } else if (is_punctuation(c)) {
             flush_word(word);
-            phones.push_back(std::string(1, (char)c));
+            phone_ids.push_back(phoneme_to_id(std::string(1, (char)c)));
             tones.push_back(0);
         }
     }
     flush_word(word);
 
     // Add end token
-    phones.push_back("_");
+    phone_ids.push_back(0);
     tones.push_back(0);
 
-    // 4. Convert to IDs
-    for (const auto& ph : phones) {
-        result.phone_ids.push_back(phoneme_to_id(ph));
-    }
+    // 4. Store IDs
+    result.phone_ids = std::move(phone_ids);
 
     // Adjust tones for English
     for (int t : tones) {

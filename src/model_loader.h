@@ -5,7 +5,6 @@
 #include <ggml-alloc.h>
 #include <gguf.h>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace inflect {
@@ -36,13 +35,12 @@ public:
 
     // Debug
     std::vector<std::string> tensor_names() const;
-    size_t n_tensors() const { return tensor_map_.size(); }
+    size_t n_tensors() const;
 
 private:
     gguf_context*         gguf_   = nullptr;
     ggml_context*         ctx_    = nullptr;
     ggml_backend_buffer_t buffer_ = nullptr;
-    std::unordered_map<std::string, ggml_tensor*> tensor_map_;
 };
 
 } // namespace inflect

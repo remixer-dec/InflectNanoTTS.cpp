@@ -60,6 +60,7 @@ struct SynthParams {
     float energy_scale = 1.0f;
     int   speaker_id   = 0;
     uint64_t seed      = 1234;
+    int   vocoder_chunk_frames = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────

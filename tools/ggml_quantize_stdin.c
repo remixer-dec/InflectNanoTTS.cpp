@@ -29,6 +29,7 @@ static int64_t local_block_size(enum ggml_type type) {
         case GGML_TYPE_Q1_0:
             return 128;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q8_0:
             return 32;
@@ -46,6 +47,7 @@ size_t ggml_type_size(enum ggml_type type) {
         case GGML_TYPE_Q6_K: return 210;
         case GGML_TYPE_Q1_0: return 18;
         case GGML_TYPE_Q4_0: return 18;
+        case GGML_TYPE_Q4_1: return 24;
         case GGML_TYPE_Q5_0: return 22;
         case GGML_TYPE_Q8_0: return 34;
         default: return 0;
@@ -65,6 +67,7 @@ const char * ggml_type_name(enum ggml_type type) {
         case GGML_TYPE_Q6_K: return "q6_K";
         case GGML_TYPE_Q1_0: return "q1_0";
         case GGML_TYPE_Q4_0: return "q4_0";
+        case GGML_TYPE_Q4_1: return "q4_1";
         case GGML_TYPE_Q5_0: return "q5_0";
         case GGML_TYPE_Q8_0: return "q8_0";
         default: return "unknown";
@@ -80,6 +83,7 @@ static enum ggml_type parse_type(const char * name) {
     if (strcmp(name, "q5_k") == 0) return GGML_TYPE_Q5_K;
     if (strcmp(name, "q6_k") == 0) return GGML_TYPE_Q6_K;
     if (strcmp(name, "q4_0") == 0) return GGML_TYPE_Q4_0;
+    if (strcmp(name, "q4_1") == 0) return GGML_TYPE_Q4_1;
     if (strcmp(name, "q5_0") == 0) return GGML_TYPE_Q5_0;
     if (strcmp(name, "q8_0") == 0) return GGML_TYPE_Q8_0;
     return GGML_TYPE_COUNT;
@@ -94,6 +98,7 @@ static size_t quantize_rows(enum ggml_type type, const float * input, void * out
         case GGML_TYPE_Q6_K: return quantize_q6_K(input, output, rows, cols, NULL);
         case GGML_TYPE_Q1_0: return quantize_q1_0(input, output, rows, cols, NULL);
         case GGML_TYPE_Q4_0: return quantize_q4_0(input, output, rows, cols, NULL);
+        case GGML_TYPE_Q4_1: return quantize_q4_1(input, output, rows, cols, NULL);
         case GGML_TYPE_Q5_0: return quantize_q5_0(input, output, rows, cols, NULL);
         case GGML_TYPE_Q8_0: return quantize_q8_0(input, output, rows, cols, NULL);
         default: return 0;

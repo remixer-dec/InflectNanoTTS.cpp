@@ -1,5 +1,6 @@
 #include "model_loader.h"
 #include <ggml-cpu.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -30,7 +31,7 @@ bool ModelLoader::load(const std::string& path) {
         return false;
     }
 
-    // ── 2. Index tensors by name ───────────────────────────────────
+    // ── 2. Verify tensors by name ──────────────────────────────────
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(gguf_, i);
         ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
@@ -38,7 +39,6 @@ bool ModelLoader::load(const std::string& path) {
             fprintf(stderr, "[ModelLoader] GGUF tensor missing from context: %s\n", name);
             return false;
         }
-        tensor_map_[name] = tensor;
     }
 
     // ── 3. Allocate CPU backend storage for all weight tensors ─────
@@ -56,30 +56,34 @@ bool ModelLoader::load(const std::string& path) {
     }
 
     size_t total_size = 0;
+    std::vector<uint8_t> data(64 * 1024);
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(gguf_, i);
-        ggml_tensor* tensor = tensor_map_[name];
+        ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
 
         size_t offset = gguf_get_data_offset(gguf_) + gguf_get_tensor_offset(gguf_, i);
         size_t nbytes = ggml_nbytes(tensor);
         total_size += nbytes;
 
-        std::vector<uint8_t> data(nbytes);
         if (fseek(f, (long)offset, SEEK_SET) != 0) {
             fprintf(stderr, "[ModelLoader] Failed to seek tensor %s\n", name);
             fclose(f);
             return false;
         }
 
-        size_t read = fread(data.data(), 1, nbytes, f);
-
-        if (read != nbytes) {
-            fprintf(stderr, "[ModelLoader] Short read for tensor %s: %zu/%zu\n", name, read, nbytes);
-            fclose(f);
-            return false;
+        size_t done = 0;
+        while (done < nbytes) {
+            const size_t chunk = std::min(data.size(), nbytes - done);
+            size_t read = fread(data.data(), 1, chunk, f);
+            if (read != chunk) {
+                fprintf(stderr, "[ModelLoader] Short read for tensor %s: %zu/%zu\n",
+                        name, done + read, nbytes);
+                fclose(f);
+                return false;
+            }
+            ggml_backend_tensor_set(tensor, data.data(), done, chunk);
+            done += chunk;
         }
-
-        ggml_backend_tensor_set(tensor, data.data(), 0, nbytes);
     }
     fclose(f);
 
@@ -89,16 +93,16 @@ bool ModelLoader::load(const std::string& path) {
 }
 
 ggml_tensor* ModelLoader::get_tensor(const std::string& name) const {
-    auto it = tensor_map_.find(name);
-    if (it == tensor_map_.end()) {
+    ggml_tensor* tensor = ctx_ ? ggml_get_tensor(ctx_, name.c_str()) : nullptr;
+    if (!tensor) {
         fprintf(stderr, "[ModelLoader] Tensor not found: %s\n", name.c_str());
         return nullptr;
     }
-    return it->second;
+    return tensor;
 }
 
 bool ModelLoader::has_tensor(const std::string& name) const {
-    return tensor_map_.find(name) != tensor_map_.end();
+    return ctx_ && ggml_get_tensor(ctx_, name.c_str()) != nullptr;
 }
 
 int32_t ModelLoader::get_i32(const std::string& key, int32_t default_val) const {
@@ -145,11 +149,16 @@ std::string ModelLoader::get_string(const std::string& key, const std::string& d
 
 std::vector<std::string> ModelLoader::tensor_names() const {
     std::vector<std::string> names;
-    names.reserve(tensor_map_.size());
-    for (const auto& [k, _] : tensor_map_) {
-        names.push_back(k);
+    const int n_tensors = gguf_ ? gguf_get_n_tensors(gguf_) : 0;
+    names.reserve(n_tensors);
+    for (int i = 0; i < n_tensors; i++) {
+        names.emplace_back(gguf_get_tensor_name(gguf_, i));
     }
     return names;
+}
+
+size_t ModelLoader::n_tensors() const {
+    return gguf_ ? (size_t)gguf_get_n_tensors(gguf_) : 0;
 }
 
 } // namespace inflect

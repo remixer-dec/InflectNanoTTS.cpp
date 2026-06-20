@@ -8,6 +8,7 @@ Usage:
     python convert.py --acoustic acoustic.pt --vocoder vocoder.pt --out_dir models/
     python convert.py --acoustic acoustic.pt --vocoder vocoder.pt --out_dir models/ --quantize q8_0
     python convert.py --acoustic acoustic.pt --vocoder vocoder.pt --out_dir models/ --quantize q4_0 --vocoder-quantize f16
+    python convert.py --skip-acoustic --vocoder vocoder.pt --out_dir models/ --vocoder-quantize q3_k --fp16-biases --quantize-final-layers
 """
 
 import argparse
@@ -38,6 +39,7 @@ QUANT_MAP.update({
     "q2_k": gguf.GGMLQuantizationType.Q2_K,
     "q3_k": gguf.GGMLQuantizationType.Q3_K,
     "q4_0": gguf.GGMLQuantizationType.Q4_0,
+    "q4_1": gguf.GGMLQuantizationType.Q4_1,
     "q4_k": gguf.GGMLQuantizationType.Q4_K,
     "q5_0": gguf.GGMLQuantizationType.Q5_0,
     "q5_k": gguf.GGMLQuantizationType.Q5_K,
@@ -242,6 +244,20 @@ def pad_dim(arr, dim, multiple):
     return np.pad(arr, pad_width, mode="constant", constant_values=0)
 
 
+def quantizer_is_usable(path):
+    try:
+        proc = subprocess.run(
+            [path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 2 and b"usage:" in proc.stderr
+
+
 def build_ggml_quantizer():
     sources = [
         os.path.join(ROOT_DIR, "tools", "ggml_quantize_stdin.c"),
@@ -249,12 +265,18 @@ def build_ggml_quantizer():
         os.path.join(ROOT_DIR, "ggml", "src", "ggml-quants.h"),
         os.path.join(ROOT_DIR, "ggml", "include", "ggml.h"),
     ]
-    if os.path.exists(GGML_QUANTIZER) and all(os.path.getmtime(GGML_QUANTIZER) >= os.path.getmtime(src) for src in sources):
+    if (
+        os.path.exists(GGML_QUANTIZER)
+        and all(os.path.getmtime(GGML_QUANTIZER) >= os.path.getmtime(src) for src in sources)
+        and quantizer_is_usable(GGML_QUANTIZER)
+    ):
         return GGML_QUANTIZER
+
     cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
     if not cc:
         raise RuntimeError("K-quant requested but no C compiler was found to build tools/ggml_quantize_stdin.c")
     os.makedirs(os.path.dirname(GGML_QUANTIZER), exist_ok=True)
+    tmp_quantizer = GGML_QUANTIZER + ".tmp"
     cmd = [
         cc,
         "-O2",
@@ -269,12 +291,29 @@ def build_ggml_quantizer():
         sources[1],
         "-lm",
         "-o",
-        GGML_QUANTIZER,
+        tmp_quantizer,
     ]
     if os.uname().sysname == "Linux":
         cmd.insert(-2, "-ldl")
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(tmp_quantizer, GGML_QUANTIZER)
+    finally:
+        if os.path.exists(tmp_quantizer):
+            os.unlink(tmp_quantizer)
+    if not quantizer_is_usable(GGML_QUANTIZER):
+        raise RuntimeError(f"built quantizer is not executable on this host: {GGML_QUANTIZER}")
     return GGML_QUANTIZER
+
+
+def run_ggml_quantizer(quantizer, qname, rows, cols, payload):
+    return subprocess.run(
+        [quantizer, qname, str(rows), str(cols)],
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
 
 
 def ggml_quantize(arr, quant_type):
@@ -282,13 +321,14 @@ def ggml_quantize(arr, quant_type):
     quantizer = build_ggml_quantizer()
     rows = int(np.prod(arr.shape[:-1]))
     cols = int(arr.shape[-1])
-    proc = subprocess.run(
-        [quantizer, qname, str(rows), str(cols)],
-        input=np.ascontiguousarray(arr, dtype=np.float32).tobytes(order="C"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    payload = np.ascontiguousarray(arr, dtype=np.float32).tobytes(order="C")
+    try:
+        proc = run_ggml_quantizer(quantizer, qname, rows, cols, payload)
+    except OSError:
+        if os.path.exists(quantizer):
+            os.unlink(quantizer)
+        quantizer = build_ggml_quantizer()
+        proc = run_ggml_quantizer(quantizer, qname, rows, cols, payload)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8", errors="replace").strip())
     row_bytes = len(proc.stdout) // rows
@@ -372,7 +412,7 @@ def parse_scope_list(value):
     return scopes
 
 
-def add_tensor(writer, name, arr, quant_type=None, stats=None, unquantized_weight_dtype="f16"):
+def add_tensor(writer, name, arr, quant_type=None, stats=None, unquantized_weight_dtype="f16", fp16_biases=False):
     """Adds a tensor to the GGUF writer, applying quantization if possible."""
     arr = np.ascontiguousarray(arr)
     requested = bool(quant_type and "log_alpha" not in name and arr.size > 1)
@@ -410,6 +450,12 @@ def add_tensor(writer, name, arr, quant_type=None, stats=None, unquantized_weigh
             stats.add("F16", arr.size * 2)
         return
 
+    if fp16_biases and name.endswith(".bias"):
+        writer.add_tensor(name, arr.astype(np.float16), raw_dtype=gguf.GGMLQuantizationType.F16)
+        if stats:
+            stats.add("F16", arr.size * 2)
+        return
+
     writer.add_tensor(name, arr.astype(np.float32))
     if stats:
         stats.add("F32", arr.size * 4)
@@ -430,7 +476,7 @@ def is_quantizable(name, scopes):
 def is_unsafe_block_quant_layout(name):
     # Depthwise weights store kernel as GGML ne[0]. Block quantization would
     # pad a 7-tap kernel to 32 and change convolution behavior.
-    return is_depthwise_weight(name) or is_postnet_weight(name)
+    return is_depthwise_weight(name)
 
 
 def strip_generator_prefix(name):
@@ -441,6 +487,10 @@ def is_vocoder_conv1d_weight(bare_name):
     return bare_name in {"conv_pre.weight", "conv_post.weight"} or "convs1." in bare_name or "convs2." in bare_name
 
 
+def is_vocoder_upsample_weight(bare_name):
+    return bare_name.startswith("ups.") and bare_name.endswith(".weight")
+
+
 def flatten_vocoder_conv1d_weight(arr, quant_type):
     # PyTorch Conv1d is [out, in, K]. Store as a GGML matrix
     # [in*K padded, out] so quantized mul_mat can consume im2col output.
@@ -448,7 +498,21 @@ def flatten_vocoder_conv1d_weight(arr, quant_type):
     return pad_dim(flat, -1, quant_block_size(quant_type))
 
 
-def process_acoustic(pt_path, out_path, quant_type=None, quant_overrides=None, unquantized_weight_dtype="f16", quant_scopes=None):
+def flatten_conv1d_weight_k_in(arr, quant_type):
+    # PyTorch Conv1d is [out, in, K]. Store one quantized row per output
+    # channel, with columns ordered as [K, in] for the direct runtime kernel.
+    flat = arr.transpose(0, 2, 1).reshape(arr.shape[0], arr.shape[2] * arr.shape[1])
+    return pad_dim(flat, -1, quant_block_size(quant_type))
+
+
+def flatten_conv_transpose1d_weight_k_in(arr, quant_type):
+    # PyTorch ConvTranspose1d is [in, out, K]. Store one quantized row per
+    # output channel, with columns ordered as [K, in].
+    flat = arr.transpose(1, 2, 0).reshape(arr.shape[1], arr.shape[2] * arr.shape[0])
+    return pad_dim(flat, -1, quant_block_size(quant_type))
+
+
+def process_acoustic(pt_path, out_path, quant_type=None, quant_overrides=None, unquantized_weight_dtype="f16", quant_scopes=None, fp16_biases=False, quantize_final_layers=False):
     print(f"Loading acoustic model from {pt_path}...")
     ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
@@ -485,6 +549,9 @@ def process_acoustic(pt_path, out_path, quant_type=None, quant_overrides=None, u
         arr = to_numpy(tensor)
         can_quantize = is_quantizable(name, quant_scopes)
         qt = resolve_quant_type(name, quant_type, quant_overrides) if can_quantize else None
+        if qt and qt != gguf.GGMLQuantizationType.F16 and is_postnet_weight(name) and not quantize_final_layers:
+            print(f"Warning: keeping {name} F16; use --quantize-final-layers for experimental quantized postnet runtime support")
+            qt = gguf.GGMLQuantizationType.F16
         if qt and qt != gguf.GGMLQuantizationType.F16 and is_unsafe_block_quant_layout(name):
             print(f"Warning: keeping {name} F16; block quantization would pad the convolution kernel axis")
             qt = gguf.GGMLQuantizationType.F16
@@ -526,8 +593,10 @@ def process_acoustic(pt_path, out_path, quant_type=None, quant_overrides=None, u
 
         # 4. Postnet Conv1d
         elif name.startswith("postnet.") and name.endswith(".weight"):
-            if can_quantize:
-                arr = pad_dim(arr, -1, quant_block_size(qt))
+            if can_quantize and qt and qt != gguf.GGMLQuantizationType.F16:
+                arr = flatten_conv1d_weight_k_in(arr, qt)
+                add_tensor(w, name, arr, qt, stats, unquantized_weight_dtype, fp16_biases)
+                continue
 
         # 5. Token embeddings
         elif name in ["phone.weight", "tone.weight", "lang.weight"]:
@@ -540,7 +609,7 @@ def process_acoustic(pt_path, out_path, quant_type=None, quant_overrides=None, u
             if can_quantize:
                 arr = pad_dim(arr, -1, quant_block_size(qt))
 
-        add_tensor(w, name, arr, qt, stats, unquantized_weight_dtype)
+        add_tensor(w, name, arr, qt, stats, unquantized_weight_dtype, fp16_biases)
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
@@ -551,7 +620,7 @@ def process_acoustic(pt_path, out_path, quant_type=None, quant_overrides=None, u
     print(f"Wrote {out_path}")
 
 
-def process_vocoder(pt_path, out_path, quant_type=None, quant_scope="all", quant_overrides=None):
+def process_vocoder(pt_path, out_path, quant_type=None, quant_scope="all", quant_overrides=None, fp16_biases=False, quantize_final_layers=False):
     print(f"Loading vocoder model from {pt_path}...")
     ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
@@ -596,27 +665,26 @@ def process_vocoder(pt_path, out_path, quant_type=None, quant_scope="all", quant
     def emit_weight(name, arr):
         bare_name = strip_generator_prefix(name)
         default_qt = quant_type if should_quantize_vocoder_conv(bare_name) else None
-        can_quantize = is_vocoder_conv1d_weight(bare_name)
+        if quantize_final_layers and is_vocoder_upsample_weight(bare_name) and quant_type and quant_type != gguf.GGMLQuantizationType.F16:
+            default_qt = quant_type
+        can_quantize = is_vocoder_conv1d_weight(bare_name) or (quantize_final_layers and is_vocoder_upsample_weight(bare_name))
         qt = resolve_quant_type(name, default_qt, quant_overrides, bare_name) if can_quantize else None
 
-        # GGUF reverses numpy dimensions into GGML ne[] order. Keep PyTorch
-        # Conv1d [out, in, K] and ConvTranspose1d [in, out, K] contiguous.
+        # Quantized Conv1d weights are stored as padded matrices for the
+        # runtime im2col + mul_mat path. Quantized ConvTranspose upsamplers
+        # require --quantize-final-layers and use a direct runtime kernel.
         if is_vocoder_conv1d_weight(bare_name) and qt and qt != gguf.GGMLQuantizationType.F16:
             arr = flatten_vocoder_conv1d_weight(arr, qt)
-            add_tensor(w, name, arr, qt, stats, "f16")
+            add_tensor(w, name, arr, qt, stats, "f16", fp16_biases)
             emitted_weights.add(name)
             return
-        elif bare_name.startswith("ups.") or ".ups." in bare_name:
-            pass
+        if quantize_final_layers and is_vocoder_upsample_weight(bare_name) and qt and qt != gguf.GGMLQuantizationType.F16:
+            arr = flatten_conv_transpose1d_weight_k_in(arr, qt)
+            add_tensor(w, name, arr, qt, stats, "f16", fp16_biases)
+            emitted_weights.add(name)
+            return
 
-        # Keep vocoder convolutions F16. GGML conv kernels in the host runtime
-        # do not accept GGUF block-quantized conv kernels here.
-        qt = None
-        if qt is None:
-            w.add_tensor(name, np.ascontiguousarray(arr).astype(np.float16), raw_dtype=gguf.GGMLQuantizationType.F16)
-            stats.add("F16", arr.size * 2)
-        else:
-            add_tensor(w, name, arr, qt, stats, "f16")
+        add_tensor(w, name, arr, stats=stats, unquantized_weight_dtype="f16", fp16_biases=fp16_biases)
         emitted_weights.add(name)
 
     for name, tensor in generator_state.items():
@@ -627,7 +695,7 @@ def process_vocoder(pt_path, out_path, quant_type=None, quant_scope="all", quant
         # Squeeze Snake activation alphas: [1, C, 1] -> [C]
         if name.endswith(".log_alpha"):
             arr = to_numpy(tensor).squeeze()
-            add_tensor(w, name, arr, stats=stats)
+            add_tensor(w, name, arr, stats=stats, fp16_biases=fp16_biases)
             continue
 
         if name.endswith(".weight"):
@@ -643,7 +711,7 @@ def process_vocoder(pt_path, out_path, quant_type=None, quant_scope="all", quant
             emit_weight(name, arr)
         else:
             arr = to_numpy(tensor)
-            add_tensor(w, name, arr, stats=stats)
+            add_tensor(w, name, arr, stats=stats, fp16_biases=fp16_biases)
 
     # Weight-normalized checkpoints often contain only .weight_v/.weight_g,
     # not a materialized .weight tensor. Emit folded weights for those pairs.
@@ -682,7 +750,12 @@ if __name__ == "__main__":
         "--vocoder-quantize",
         default=None,
         choices=sorted(QUANT_MAP.keys()),
-        help="Vocoder quantization type. Defaults to --quantize when set, otherwise F16. Upsample transposed convs stay F16.",
+        help="Vocoder Conv1d quantization type. Accepts any supported quant type, including q3_k. Defaults to --quantize when set, otherwise F16.",
+    )
+    parser.add_argument(
+        "--quantize-final-layers",
+        action="store_true",
+        help="Also quantize experimental final-layer convs: acoustic postnet and vocoder upsample ConvTranspose1d weights.",
     )
     parser.add_argument(
         "--vocoder-quantize-scope",
@@ -713,13 +786,18 @@ if __name__ == "__main__":
         action="append",
         default=[],
         metavar="PATTERN=TYPE",
-        help="Override vocoder Conv1d quantization for matching full or generator-stripped tensor names. PATTERN is glob or re:REGEX. Repeatable; later matches win.",
+        help="Override eligible vocoder quantization for matching full or generator-stripped tensor names. PATTERN is glob or re:REGEX. Repeatable; later matches win.",
     )
     parser.add_argument(
         "--unquantized-weight-dtype",
         default="f16",
         choices=["f16", "f32"],
-        help="Storage dtype for unquantized multi-dimensional weight tensors. Biases, norms, scalars, and alphas stay F32.",
+        help="Storage dtype for unquantized multi-dimensional weight tensors. Biases stay F32 unless --fp16-biases is set; norms, scalars, and alphas stay F32.",
+    )
+    parser.add_argument(
+        "--fp16-biases",
+        action="store_true",
+        help="Store *.bias tensors as FP16. Off by default for parity; useful for low-memory model builds.",
     )
     args = parser.parse_args()
 
@@ -737,6 +815,8 @@ if __name__ == "__main__":
     acoustic_override_specs = read_override_files(args.acoustic_quantize_override_file) + args.acoustic_quantize_override
     acoustic_overrides = parse_quant_overrides(acoustic_override_specs, "acoustic")
     acoustic_quant_scopes = parse_scope_list(args.acoustic_quantize_scope)
+    if args.quantize_final_layers:
+        acoustic_quant_scopes.add("postnet")
     vocoder_overrides = parse_quant_overrides(args.vocoder_quantize_override, "vocoder")
 
     if not args.skip_acoustic:
@@ -747,6 +827,8 @@ if __name__ == "__main__":
             acoustic_overrides,
             args.unquantized_weight_dtype,
             acoustic_quant_scopes,
+            args.fp16_biases,
+            args.quantize_final_layers,
         )
     if not args.skip_vocoder:
         process_vocoder(
@@ -755,6 +837,8 @@ if __name__ == "__main__":
             vocoder_q_type,
             args.vocoder_quantize_scope,
             vocoder_overrides,
+            args.fp16_biases,
+            args.quantize_final_layers,
         )
 
     print("\nConversion complete!")

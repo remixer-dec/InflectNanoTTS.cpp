@@ -89,6 +89,13 @@ struct AcousticWeights {
     ggml_tensor *post4_w, *post4_b;
 };
 
+struct QuantConv1dOpData {
+    int kernel_size;
+    int stride;
+    int padding;
+    int dilation;
+};
+
 // ─────────────────────────────────────────────────────────────────────────
 // Intermediate results
 // ─────────────────────────────────────────────────────────────────────────
@@ -152,6 +159,7 @@ private:
     AcousticConfig config_;
     AcousticWeights weights_;
     ggml_context* wctx_ = nullptr;  // holds weight tensor metadata
+    std::vector<QuantConv1dOpData> quant_conv1d_ops_;
 
     // ── Graph builders ─────────────────────────────────────────────
     ggml_cgraph* build_encoder_graph(
@@ -164,7 +172,8 @@ private:
 
     ggml_cgraph* build_decoder_graph(
         ggml_context* gctx,
-        ggml_tensor* features  // [n_frames, hidden, 1]
+        ggml_tensor* features,  // [n_frames, hidden, 1]
+        void* gru_op_data
     );
 
     // ── Layer helpers ──────────────────────────────────────────────
@@ -194,17 +203,6 @@ private:
         int kernel_size,
         int padding,
         int dilation
-    );
-
-    // Bidirectional GRU (implemented as custom op for now)
-    ggml_tensor* bidirectional_gru(
-        ggml_context* gctx,
-        ggml_tensor* x,  // [T, H, 1]
-        ggml_tensor* w_ih, ggml_tensor* w_hh,
-        ggml_tensor* b_ih, ggml_tensor* b_hh,
-        ggml_tensor* w_ih_r, ggml_tensor* w_hh_r,
-        ggml_tensor* b_ih_r, ggml_tensor* b_hh_r,
-        int hidden_size
     );
 
     // ── Utility ────────────────────────────────────────────────────

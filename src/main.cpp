@@ -13,11 +13,21 @@ int main(int argc, char** argv) {
     std::string cmudict_path  = "cmudict.bin";
     std::string output_path   = "output.wav";
     int n_threads = -1;
+    int vocoder_chunk_frames = 0;
 
     if (const char* env = std::getenv("INFLECT_THREADS")) {
         int parsed = std::atoi(env);
         if (parsed > 0) n_threads = parsed;
     }
+    if (const char* env = std::getenv("INFLECT_VOCODER_CHUNK_FRAMES")) {
+        int parsed = std::atoi(env);
+        if (parsed > 0) vocoder_chunk_frames = parsed;
+    }
+#if defined(INFLECT_LOW_MEMORY)
+    if (vocoder_chunk_frames <= 0) {
+        vocoder_chunk_frames = 16;
+    }
+#endif
 
     // Parse args (simplified)
     for (int i = 1; i < argc; i++) {
@@ -28,6 +38,9 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "-o" && i + 1 < argc) output_path = argv[++i];
         if ((std::string(argv[i]) == "-j" || std::string(argv[i]) == "--threads") && i + 1 < argc) {
             n_threads = std::atoi(argv[++i]);
+        }
+        if (std::string(argv[i]) == "--vocoder-chunk-frames" && i + 1 < argc) {
+            vocoder_chunk_frames = std::atoi(argv[++i]);
         }
     }
 
@@ -54,6 +67,7 @@ int main(int argc, char** argv) {
     params.energy_scale = 1.0f;
     params.speaker_id   = 0;
     params.seed         = 1234;
+    params.vocoder_chunk_frames = vocoder_chunk_frames;
 
     fprintf(stderr, "Synthesizing: %s\n", text.c_str());
     auto audio = synth.synthesize(text, params);

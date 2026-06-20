@@ -1,4 +1,5 @@
 #include "acoustic_model.h"
+#include "memory_trace.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -16,6 +17,11 @@ static void print_tensor_shape(const char* label, const ggml_tensor* t) {
             t ? (long long)t->ne[1] : 0,
             t ? (long long)t->ne[2] : 0,
             t ? (long long)t->ne[3] : 0);
+}
+
+static bool debug_dump_enabled() {
+    const char* dir = std::getenv("INFLECT_DUMP_DIR");
+    return dir && dir[0];
 }
 
 static float tensor_get_f32(const ggml_tensor* t, int64_t i0, int64_t i1 = 0, int64_t i2 = 0) {
@@ -113,6 +119,9 @@ static void require_repeat_compatible(const char* op, const char* where,
 }
 static ggml_tensor* checked_add(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, const char* where) {
     require_repeat_compatible("add", where, a, b);
+    if (b->type != a->type && !ggml_is_quantized(b->type)) {
+        b = ggml_cast(ctx, b, a->type);
+    }
     return ggml_add(ctx, a, b);
 }
 
@@ -126,6 +135,79 @@ static ggml_tensor* trim_ne0(ggml_context* ctx, ggml_tensor* x, int64_t ne0) {
         std::abort();
     }
     return ggml_view_3d(ctx, x, ne0, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
+}
+
+static void quant_conv1d_op(
+    ggml_tensor* dst,
+    int ith,
+    int nth,
+    void* userdata
+) {
+    const auto* p = static_cast<const QuantConv1dOpData*>(userdata);
+    const ggml_tensor* x = dst->src[0];      // [T, in_ch, B]
+    const ggml_tensor* weight = dst->src[1]; // [K*in_ch padded, out_ch]
+
+    const int64_t T = dst->ne[0];
+    const int64_t out_ch = dst->ne[1];
+    const int64_t batch = dst->ne[2];
+    const int64_t in_ch = x->ne[1];
+    const int64_t total = T * out_ch * batch;
+    const int64_t start = (total * ith) / nth;
+    const int64_t end = (total * (ith + 1)) / nth;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        const int64_t t = idx % T;
+        const int64_t o = (idx / T) % out_ch;
+        const int64_t b = idx / (T * out_ch);
+        float v = 0.0f;
+
+        for (int64_t k = 0; k < p->kernel_size; k++) {
+            const int64_t src_t = t * p->stride + k * p->dilation - p->padding;
+            if (src_t < 0 || src_t >= x->ne[0]) {
+                continue;
+            }
+            for (int64_t i = 0; i < in_ch; i++) {
+                const int64_t flat = k * in_ch + i;
+                v += tensor_get_f32(x, src_t, i, b) * tensor_get_f32(weight, flat, o, 0);
+            }
+        }
+
+        tensor_set_f32(dst, v, t, o, b);
+    }
+}
+
+static ggml_tensor* quant_or_f16_conv1d(
+    ggml_context* ctx,
+    ggml_tensor* weight,
+    ggml_tensor* x,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation,
+    std::vector<QuantConv1dOpData>& op_data
+) {
+    if (!ggml_is_quantized(weight->type)) {
+        ggml_tensor* kernel = weight;
+        if (kernel->type != GGML_TYPE_F16) {
+            kernel = ggml_cast(ctx, kernel, GGML_TYPE_F16);
+        }
+        return ggml_conv_1d(ctx, kernel, x, stride, padding, dilation);
+    }
+
+    const int64_t in_ch = x->ne[1];
+    const int64_t out_ch = weight->ne[1];
+    const int64_t flat = kernel_size * in_ch;
+    if (weight->ne[0] < flat) {
+        fprintf(stderr, "[AcousticModel] quantized conv weight too small: weight=[%lld,%lld] flat=%lld\n",
+                (long long)weight->ne[0], (long long)weight->ne[1], (long long)flat);
+        std::abort();
+    }
+
+    const int64_t out_t = (x->ne[0] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    op_data.push_back({kernel_size, stride, padding, dilation});
+    ggml_tensor* args[] = {x, weight};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, out_t, out_ch, x->ne[2], 1,
+                          args, 2, quant_conv1d_op, GGML_N_TASKS_MAX, &op_data.back());
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -195,7 +277,12 @@ static ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x,
         std::abort();
     }
     x = ggml_mul_mat(ctx, mat_w, x);
-    if (b) x = ggml_add(ctx, x, b);
+    if (b) {
+        if (b->type != x->type && !ggml_is_quantized(b->type)) {
+            b = ggml_cast(ctx, b, x->type);
+        }
+        x = ggml_add(ctx, x, b);
+    }
     return x;
 }
 
@@ -425,24 +512,11 @@ static ggml_tensor* bidirectional_gru(
     ggml_tensor* b_ih, ggml_tensor* b_hh,
     ggml_tensor* w_ih_r, ggml_tensor* w_hh_r,
     ggml_tensor* b_ih_r, ggml_tensor* b_hh_r,
-    int hidden_size
+    int hidden_size,
+    GruOpData* data
 ) {
-    auto* data = new GruOpData{w_ih, w_hh, b_ih, b_hh, w_ih_r, w_hh_r, b_ih_r, b_hh_r, hidden_size};
+    *data = GruOpData{w_ih, w_hh, b_ih, b_hh, w_ih_r, w_hh_r, b_ih_r, b_hh_r, hidden_size};
     return ggml_map_custom1(ctx, x, gru_op, 1, data);
-}
-
-ggml_tensor* AcousticModel::bidirectional_gru(
-    ggml_context* ctx,
-    ggml_tensor* x,
-    ggml_tensor* w_ih, ggml_tensor* w_hh,
-    ggml_tensor* b_ih, ggml_tensor* b_hh,
-    ggml_tensor* w_ih_r, ggml_tensor* w_hh_r,
-    ggml_tensor* b_ih_r, ggml_tensor* b_hh_r,
-    int hidden_size
-) {
-    return inflect::bidirectional_gru(ctx, x, w_ih, w_hh, b_ih, b_hh,
-                                      w_ih_r, w_hh_r, b_ih_r, b_hh_r,
-                                      hidden_size);
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -484,17 +558,23 @@ ggml_cgraph* AcousticModel::build_encoder_graph(
     ggml_tensor* x = checked_add(gctx, checked_add(gctx, phone_emb, tone_emb, "phone + tone"), lang_emb, "embeddings + lang");
     x = checked_add(gctx, x, spk_emb, "embeddings + speaker");
 
-    // Save pointer to embedding sum before encoder blocks modify x.
-    ggml_tensor* embed_sum = x;
-    ggml_set_name(embed_sum, "embed_sum_internal");
+    const bool capture_debug = debug_dump_enabled();
+    ggml_tensor* embed_sum = capture_debug ? x : nullptr;
+    if (embed_sum) {
+        ggml_set_name(embed_sum, "embed_sum_internal");
+    }
 
     // ── Encoder blocks ──────────────────────────────────────────────
     std::vector<ggml_tensor*> enc_block_outs;
-    enc_block_outs.reserve(config_.encoder_layers);
+    if (capture_debug) {
+        enc_block_outs.reserve(config_.encoder_layers);
+    }
     for (int i = 0; i < config_.encoder_layers; i++) {
         x = build_conv_block(gctx, x, weights_.enc_blocks[i],
                              config_.encoder_ff_mult, nullptr);
-        enc_block_outs.push_back(ggml_cpy(gctx, x, ggml_dup_tensor(gctx, x)));
+        if (capture_debug) {
+            enc_block_outs.push_back(ggml_cpy(gctx, x, ggml_dup_tensor(gctx, x)));
+        }
     }
 
     // ── Prediction heads ────────────────────────────────────────────
@@ -524,7 +604,7 @@ ggml_cgraph* AcousticModel::build_encoder_graph(
     pitch = linear(gctx, pitch, weights_.pitch_l2_w, weights_.pitch_l2_b); // [2, T, 1]
 
     // ── Output copies ───────────────────────────────────────────────
-    ggml_tensor* embed_sum_out = ggml_cpy(gctx, embed_sum, ggml_dup_tensor(gctx, embed_sum));
+    ggml_tensor* embed_sum_out = capture_debug ? ggml_cpy(gctx, embed_sum, ggml_dup_tensor(gctx, embed_sum)) : nullptr;
     ggml_tensor* encoded_out = ggml_cpy(gctx, x, ggml_dup_tensor(gctx, x));
     ggml_tensor* dur_out     = ggml_cpy(gctx, dur, ggml_dup_tensor(gctx, dur));
     ggml_tensor* energy_out  = ggml_cpy(gctx, energy, ggml_dup_tensor(gctx, energy));
@@ -532,11 +612,13 @@ ggml_cgraph* AcousticModel::build_encoder_graph(
     ggml_tensor* pitch_out   = ggml_cpy(gctx, pitch, ggml_dup_tensor(gctx, pitch));
 
     // ── Build graph ─────────────────────────────────────────────────
-    ggml_cgraph* graph = ggml_new_graph(gctx);
+    ggml_cgraph* graph = ggml_new_graph_custom(gctx, 1024, false);
 
-    ggml_build_forward_expand(graph, embed_sum_out);
-    for (ggml_tensor* block_out : enc_block_outs) {
-        ggml_build_forward_expand(graph, block_out);
+    if (capture_debug) {
+        ggml_build_forward_expand(graph, embed_sum_out);
+        for (ggml_tensor* block_out : enc_block_outs) {
+            ggml_build_forward_expand(graph, block_out);
+        }
     }
     ggml_build_forward_expand(graph, encoded_out);
     ggml_build_forward_expand(graph, dur_out);
@@ -544,9 +626,11 @@ ggml_cgraph* AcousticModel::build_encoder_graph(
     ggml_build_forward_expand(graph, bright_out);
     ggml_build_forward_expand(graph, pitch_out);
     // Store output tensor names for extraction
-    ggml_set_name(embed_sum_out, "embed_sum");
-    for (int i = 0; i < (int)enc_block_outs.size(); i++) {
-        ggml_set_name(enc_block_outs[i], ("enc_block_" + std::to_string(i)).c_str());
+    if (capture_debug) {
+        ggml_set_name(embed_sum_out, "embed_sum");
+        for (int i = 0; i < (int)enc_block_outs.size(); i++) {
+            ggml_set_name(enc_block_outs[i], ("enc_block_" + std::to_string(i)).c_str());
+        }
     }
     ggml_set_name(encoded_out, "encoded");
     ggml_set_name(dur_out,     "log_durations");
@@ -563,7 +647,8 @@ ggml_cgraph* AcousticModel::build_encoder_graph(
 
 ggml_cgraph* AcousticModel::build_decoder_graph(
     ggml_context* gctx,
-    ggml_tensor* features  // [H, n_frames, 1]
+    ggml_tensor* features,  // [H, n_frames, 1]
+    void* gru_op_data
 ) {
     const int H = config_.hidden;
     const int n_mels = config_.n_mels;
@@ -579,12 +664,13 @@ ggml_cgraph* AcousticModel::build_decoder_graph(
 
     // ── Bidirectional GRU ───────────────────────────────────────────
     int gru_hidden = H / 2; // 84, concatenated to 168
-    ggml_tensor* gru = bidirectional_gru(gctx, x,
+    ggml_tensor* gru = inflect::bidirectional_gru(gctx, x,
         weights_.gru_w_ih, weights_.gru_w_hh,
         weights_.gru_b_ih, weights_.gru_b_hh,
         weights_.gru_w_ih_r, weights_.gru_w_hh_r,
         weights_.gru_b_ih_r, weights_.gru_b_hh_r,
-        gru_hidden); // [H, T, 1]
+        gru_hidden,
+        static_cast<GruOpData*>(gru_op_data)); // [H, T, 1]
     x = checked_add(gctx, x, gru, "frame_gru residual");
 
     // ── Mel head ────────────────────────────────────────────────────
@@ -598,13 +684,13 @@ ggml_cgraph* AcousticModel::build_decoder_graph(
     // Postnet runs in GGML conv layout [T, C, B], then returns to [C, T, B].
     ggml_tensor* post = ggml_permute(gctx, mel, 1, 0, 2, 3);
     post = ggml_cont(gctx, post);
-    post = ggml_conv_1d(gctx, ggml_cast(gctx, weights_.post0_w, GGML_TYPE_F16), post, 1, 2, 1);
+    post = quant_or_f16_conv1d(gctx, weights_.post0_w, post, 5, 1, 2, 1, quant_conv1d_ops_);
     post = checked_add(gctx, post, ggml_reshape_3d(gctx, weights_.post0_b, 1, H, 1), "postnet.0 bias");
     post = ggml_tanh(gctx, post);
-    post = ggml_conv_1d(gctx, ggml_cast(gctx, weights_.post2_w, GGML_TYPE_F16), post, 1, 2, 1);
+    post = quant_or_f16_conv1d(gctx, weights_.post2_w, post, 5, 1, 2, 1, quant_conv1d_ops_);
     post = checked_add(gctx, post, ggml_reshape_3d(gctx, weights_.post2_b, 1, H, 1), "postnet.2 bias");
     post = ggml_tanh(gctx, post);
-    post = ggml_conv_1d(gctx, ggml_cast(gctx, weights_.post4_w, GGML_TYPE_F16), post, 1, 2, 1);
+    post = quant_or_f16_conv1d(gctx, weights_.post4_w, post, 5, 1, 2, 1, quant_conv1d_ops_);
     post = checked_add(gctx, post, ggml_reshape_3d(gctx, weights_.post4_b, 1, n_mels, 1), "postnet.4 bias");
     post = ggml_permute(gctx, post, 1, 0, 2, 3);
     post = ggml_cont(gctx, post);
@@ -614,7 +700,7 @@ ggml_cgraph* AcousticModel::build_decoder_graph(
 
     // ── Build graph ─────────────────────────────────────────────────
     ggml_set_name(x, "mel");
-    ggml_cgraph* graph = ggml_new_graph(gctx);
+    ggml_cgraph* graph = ggml_new_graph_custom(gctx, 1024, false);
     ggml_build_forward_expand(graph, x);
     return graph;
 }
@@ -634,7 +720,7 @@ EncoderOutput AcousticModel::run_encoder(
     const int H = config_.hidden;
 
     // Create graph context
-    size_t gctx_size = 16 * 1024 * 1024;
+    size_t gctx_size = 2 * 1024 * 1024;
     struct ggml_init_params gparams = {
         .mem_size   = gctx_size,
         .mem_buffer = nullptr,
@@ -656,6 +742,7 @@ EncoderOutput AcousticModel::run_encoder(
     // Allocate and compute
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_alloc_graph(allocr, graph);
+    mem_trace_graph("encoder", gctx, allocr);
 
     // Set input tensors after allocation
     ggml_backend_tensor_set(phone_t, phone_ids.data(), 0, T * sizeof(int32_t));
@@ -680,18 +767,19 @@ EncoderOutput AcousticModel::run_encoder(
         return data;
     };
 
-    // Read embed_sum FIRST (it is marked OUTPUT so the allocator keeps its buffer)
-    ggml_tensor* esum_t = ggml_get_tensor(gctx, "embed_sum");
-    if (esum_t) {
-        out.embed_sum = to_host(esum_t);
-    }
+    if (debug_dump_enabled()) {
+        ggml_tensor* esum_t = ggml_get_tensor(gctx, "embed_sum");
+        if (esum_t) {
+            out.embed_sum = to_host(esum_t);
+        }
 
-    out.enc_blocks.clear();
-    out.enc_blocks.reserve(config_.encoder_layers);
-    for (int i = 0; i < config_.encoder_layers; i++) {
-        ggml_tensor* block_t = ggml_get_tensor(gctx, ("enc_block_" + std::to_string(i)).c_str());
-        if (block_t) {
-            out.enc_blocks.push_back(to_host(block_t));
+        out.enc_blocks.clear();
+        out.enc_blocks.reserve(config_.encoder_layers);
+        for (int i = 0; i < config_.encoder_layers; i++) {
+            ggml_tensor* block_t = ggml_get_tensor(gctx, ("enc_block_" + std::to_string(i)).c_str());
+            if (block_t) {
+                out.enc_blocks.push_back(to_host(block_t));
+            }
         }
     }
 
@@ -777,22 +865,23 @@ RegulatedFeatures AcousticModel::length_regulate(
     }
     total_frames = std::min(total_frames, config_.max_frames);
 
-    // ── Token-level conditioning: encoded + energy_proj + bright_proj ──
-    std::vector<float> conditioned(T * H);
-    for (int t = 0; t < T; t++) {
+    auto compute_conditioned = [&](int t, float* out) {
         const float energy = energy_pred[t] * energy_scale;
         const float bright = bright_pred[t];
         for (int h = 0; h < H; h++) {
             float v = enc.encoded[h + t * H];
             v += energy * weight(weights_.energy_proj_w, 0, h) + bias(weights_.energy_proj_b, h);
             v += bright * weight(weights_.bright_proj_w, 0, h) + bias(weights_.bright_proj_b, h);
-            conditioned[t * H + h] = v;
+            out[h] = v;
         }
-    }
+    };
 
     // ── Expand to frame-level and add frame/prosody/context features ──
     int n_frames = total_frames;
     std::vector<float> regulated(n_frames * H);
+    std::vector<float> prev_cond(H);
+    std::vector<float> cur_cond(H);
+    std::vector<float> next_cond(H);
     std::vector<float> frame_hidden(H);
     std::vector<float> frame_proj(H);
     std::vector<float> pitch_hidden(H);
@@ -807,11 +896,14 @@ RegulatedFeatures AcousticModel::length_regulate(
         const int dur = durations[t];
         const int prev_t = std::max(0, t - 1);
         const int next_t = std::min(T - 1, t + 1);
+        compute_conditioned(prev_t, prev_cond.data());
+        compute_conditioned(t, cur_cond.data());
+        compute_conditioned(next_t, next_cond.data());
 
         for (int h = 0; h < H; h++) {
-            ctx_in[h] = conditioned[prev_t * H + h];
-            ctx_in[H + h] = conditioned[t * H + h];
-            ctx_in[2 * H + h] = conditioned[next_t * H + h];
+            ctx_in[h] = prev_cond[h];
+            ctx_in[H + h] = cur_cond[h];
+            ctx_in[2 * H + h] = next_cond[h];
         }
         linear_full(ctx_in.data(), 3 * H, weights_.lctx0_w, weights_.lctx0_b,
                     ctx_hidden.data(), 2 * H);
@@ -852,7 +944,7 @@ RegulatedFeatures AcousticModel::length_regulate(
 
             for (int h = 0; h < H; h++) {
                 regulated[f * H + h] =
-                    conditioned[t * H + h] +
+                    cur_cond[h] +
                     frame_proj[h] +
                     ctx_proj[h] +
                     tensor_get_f32(weights_.abs_frame_emb, h, bin, 0) +
@@ -876,7 +968,7 @@ std::vector<float> AcousticModel::run_decoder(
     const int n_mels = config_.n_mels;
 
     // Create graph context + input tensor
-    size_t gctx_size = 16 * 1024 * 1024;
+    size_t gctx_size = 2 * 1024 * 1024;
     struct ggml_init_params gparams = {
         .mem_size   = gctx_size,
         .mem_buffer = nullptr,
@@ -889,11 +981,15 @@ std::vector<float> AcousticModel::run_decoder(
     ggml_set_input(features_t);
 
     // Build graph
-    ggml_cgraph* graph = build_decoder_graph(gctx, features_t);
+    GruOpData gru_data{};
+    quant_conv1d_ops_.clear();
+    quant_conv1d_ops_.reserve(3);
+    ggml_cgraph* graph = build_decoder_graph(gctx, features_t, &gru_data);
 
     // Allocate
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_alloc_graph(allocr, graph);
+    mem_trace_graph("decoder", gctx, allocr);
 
     // Set input
     ggml_backend_tensor_set(features_t, features.features.data(), 0, features.features.size() * sizeof(float));

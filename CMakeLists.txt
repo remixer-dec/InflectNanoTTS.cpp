@@ -12,6 +12,7 @@ set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+option(INFLECT_LOW_MEMORY "Enable compile-time low-memory defaults for edge devices" OFF)
 
 add_subdirectory(ggml)
 
@@ -30,3 +31,7 @@ target_include_directories(inflect-nano PRIVATE
 )
 
 target_link_libraries(inflect-nano PRIVATE ggml)
+
+if(INFLECT_LOW_MEMORY)
+    target_compile_definitions(inflect-nano PRIVATE INFLECT_LOW_MEMORY)
+endif()

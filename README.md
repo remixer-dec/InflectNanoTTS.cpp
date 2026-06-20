@@ -2,7 +2,8 @@
 
 Small C++/GGML port of the [Inflect-Nano TTS](https://huggingface.co/owensong/Inflect-Nano-v1) pipeline.
 
-This repo contains the runtime, conversion helpers, and parity/debug tooling.
+This repo contains the runtime, conversion helpers, and parity/debug tooling. Currently only cpu inference is supported. 
+Pre-quantized weights are available [here](https://huggingface.co/remixerdec/Inflect-Nano-v1-GGUF).
 
 ## Layout
 
@@ -25,6 +26,18 @@ With the fallback script:
 
 ```bash
 ./tools/build.sh
+```
+
+### Low-memory build
+
+For edge devices, compile with `INFLECT_LOW_MEMORY`. This enables flash/file-backed CMU lookup, defers vocoder loading until after acoustic inference, releases acoustic memory before vocoding, and uses smaller vocoder chunks.
+
+```bash
+cmake -S . -B build-lowmem -DINFLECT_LOW_MEMORY=ON
+cmake --build build-lowmem -j
+
+# or
+INFLECT_LOW_MEMORY=1 BUILD_DIR=build/lowmem ./tools/build.sh
 ```
 
 ## Run

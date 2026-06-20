@@ -61,10 +61,8 @@ private:
     std::unique_ptr<TextFrontend>  frontend_;
     std::unique_ptr<ModelLoader>   acoustic_loader_;
     std::unique_ptr<ModelLoader>   vocoder_loader_;
-
-    // Shared work memory for graph computation
-    std::vector<uint8_t> work_mem_;
-    static constexpr size_t WORK_MEM_SIZE = 512 * 1024 * 1024; // 512 MB
+    std::string deferred_vocoder_path_;
+    bool load_vocoder_now(const std::string& path);
 };
 
 } // namespace inflect

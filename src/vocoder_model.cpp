@@ -1,4 +1,5 @@
 #include "vocoder_model.h"
+#include "memory_trace.h"
 #include <ggml-cpu.h>
 #include <cmath>
 #include <cstring>
@@ -16,8 +17,59 @@ static ggml_tensor* channel_param_3d(ggml_context* gctx, ggml_tensor* t) {
     return ggml_reshape_3d(gctx, t, 1, t->ne[0], 1);
 }
 
+static float tensor_get_f32(const ggml_tensor* t, int64_t i0, int64_t i1 = 0, int64_t i2 = 0) {
+    const char* ptr = (const char*)t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2];
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            return *(const float*)ptr;
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(*(const ggml_fp16_t*)ptr);
+        default:
+            break;
+    }
+    if (ggml_is_quantized(t->type)) {
+        const auto* traits = ggml_get_type_traits(t->type);
+        if (!traits || !traits->to_float) {
+            fprintf(stderr, "[VocoderModel] unsupported quantized tensor read type %s for %s\n",
+                    ggml_type_name(t->type), t->name);
+            std::abort();
+        }
+
+        const char* row_ptr = (const char*)t->data + i1 * t->nb[1] + i2 * t->nb[2];
+        struct QuantRowCache {
+            const ggml_tensor* tensor = nullptr;
+            const char* row = nullptr;
+            std::vector<float> values;
+        };
+        thread_local QuantRowCache cache;
+        if (cache.tensor != t || cache.row != row_ptr || (int64_t)cache.values.size() != t->ne[0]) {
+            cache.tensor = t;
+            cache.row = row_ptr;
+            cache.values.resize(t->ne[0]);
+            traits->to_float(row_ptr, cache.values.data(), t->ne[0]);
+        }
+        return cache.values[i0];
+    }
+    fprintf(stderr, "[VocoderModel] unsupported direct tensor read type %s for %s\n",
+            ggml_type_name(t->type), t->name);
+    std::abort();
+}
+
+static void tensor_set_f32(ggml_tensor* t, float v, int64_t i0, int64_t i1, int64_t i2) {
+    if (t->type != GGML_TYPE_F32) {
+        fprintf(stderr, "[VocoderModel] unsupported direct tensor write type %s for %s\n",
+                ggml_type_name(t->type), t->name);
+        std::abort();
+    }
+    *(float*)((char*)t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]) = v;
+}
+
 static ggml_tensor* add_channel_bias(ggml_context* gctx, ggml_tensor* x, ggml_tensor* bias) {
-    return ggml_add(gctx, x, channel_param_3d(gctx, bias));
+    ggml_tensor* b = channel_param_3d(gctx, bias);
+    if (b->type != x->type && !ggml_is_quantized(b->type)) {
+        b = ggml_cast(gctx, b, x->type);
+    }
+    return ggml_add(gctx, x, b);
 }
 
 static ggml_tensor* crop_time_3d(ggml_context* gctx, ggml_tensor* x, int left, int right) {
@@ -117,6 +169,82 @@ static ggml_tensor* conv1d_vocoder(
     ggml_tensor* y = ggml_mul_mat(gctx, weight, cols);
     y = ggml_cont(gctx, ggml_transpose(gctx, y));
     return ggml_reshape_3d(gctx, y, im2col->ne[1], out_ch, im2col->ne[2]);
+}
+
+static void quant_conv_transpose1d_op(
+    ggml_tensor* dst,
+    int ith,
+    int nth,
+    void* userdata
+) {
+    const auto* p = static_cast<const QuantConvTranspose1dOpData*>(userdata);
+    const ggml_tensor* x = dst->src[0];      // [T_in, in_ch, B]
+    const ggml_tensor* weight = dst->src[1]; // [K*in_ch padded, out_ch]
+
+    const int64_t out_t = dst->ne[0];
+    const int64_t out_ch = dst->ne[1];
+    const int64_t batch = dst->ne[2];
+    const int64_t in_t = x->ne[0];
+    const int64_t in_ch = x->ne[1];
+    const int64_t total = out_t * out_ch * batch;
+    const int64_t start = (total * ith) / nth;
+    const int64_t end = (total * (ith + 1)) / nth;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        const int64_t t = idx % out_t;
+        const int64_t o = (idx / out_t) % out_ch;
+        const int64_t b = idx / (out_t * out_ch);
+        float v = 0.0f;
+
+        for (int64_t k = 0; k < p->kernel_size; k++) {
+            const int64_t rem = t - k;
+            if (rem < 0 || rem % p->stride != 0) {
+                continue;
+            }
+            const int64_t src_t = rem / p->stride;
+            if (src_t < 0 || src_t >= in_t) {
+                continue;
+            }
+            for (int64_t i = 0; i < in_ch; i++) {
+                const int64_t flat = k * in_ch + i;
+                v += tensor_get_f32(x, src_t, i, b) * tensor_get_f32(weight, flat, o, 0);
+            }
+        }
+
+        tensor_set_f32(dst, v, t, o, b);
+    }
+}
+
+static ggml_tensor* quant_or_f16_conv_transpose_1d(
+    ggml_context* ctx,
+    ggml_tensor* weight,
+    ggml_tensor* x,
+    int kernel_size,
+    int stride,
+    std::vector<QuantConvTranspose1dOpData>& op_data
+) {
+    if (!ggml_is_quantized(weight->type)) {
+        ggml_tensor* kernel = weight;
+        if (kernel->type != GGML_TYPE_F16) {
+            kernel = ggml_cast(ctx, kernel, GGML_TYPE_F16);
+        }
+        return ggml_conv_transpose_1d(ctx, kernel, x, stride, 0, 1);
+    }
+
+    const int64_t in_ch = x->ne[1];
+    const int64_t out_ch = weight->ne[1];
+    const int64_t flat = kernel_size * in_ch;
+    if (weight->ne[0] < flat) {
+        fprintf(stderr, "[VocoderModel] quantized upsample weight too small: weight=[%lld,%lld] flat=%lld\n",
+                (long long)weight->ne[0], (long long)weight->ne[1], (long long)flat);
+        std::abort();
+    }
+
+    const int64_t out_t = (x->ne[0] - 1) * stride + kernel_size;
+    op_data.push_back({kernel_size, stride});
+    ggml_tensor* args[] = {x, weight};
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, out_t, out_ch, x->ne[2], 1,
+                          args, 2, quant_conv_transpose1d_op, GGML_N_TASKS_MAX, &op_data.back());
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -410,7 +538,7 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
         // Transposed conv: upsampling
         // ggml_conv_transpose_1d(ctx, kernel, input, stride, padding, dilation)
         // This GGML revision only supports p0=0 and d0=1 for conv_transpose_1d.
-        x = ggml_conv_transpose_1d(gctx, weights_.ups_w[i], x, rate, 0, 1);
+        x = quant_or_f16_conv_transpose_1d(gctx, weights_.ups_w[i], x, K, rate, quant_conv_transpose_ops_);
         x = crop_time_3d(gctx, x, pad, pad);
         capture("vocoder_upsample_" + std::to_string(i), x);
 
@@ -440,7 +568,7 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     capture("vocoder_tanh", x);
 
     // ── Build graph ─────────────────────────────────────────────────
-    ggml_cgraph* graph = ggml_new_graph(gctx);
+    ggml_cgraph* graph = ggml_new_graph_custom(gctx, 1536, false);
     for (ggml_tensor* out : debug_outputs) {
         ggml_build_forward_expand(graph, out);
     }
@@ -462,7 +590,7 @@ std::vector<float> VocoderModel::vocode(
     ggml_backend_t backend
 ) {
     // Create graph context
-    size_t gctx_size = 32 * 1024 * 1024;
+    size_t gctx_size = 4 * 1024 * 1024;
     struct ggml_init_params gparams = {
         .mem_size   = gctx_size,
         .mem_buffer = nullptr,
@@ -474,11 +602,14 @@ std::vector<float> VocoderModel::vocode(
     ggml_tensor* mel_t = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, n_mels, n_frames, 1);
 
     // Build graph
+    quant_conv_transpose_ops_.clear();
+    quant_conv_transpose_ops_.reserve(config_.upsample_rates.size());
     ggml_cgraph* graph = build_vocoder_graph(gctx, mel_t);
 
     // Allocate
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_gallocr_alloc_graph(allocr, graph);
+    mem_trace_graph("vocoder", gctx, allocr);
 
     // Set input
     ggml_backend_tensor_set(mel_t, mel.data(), 0, n_mels * n_frames * sizeof(float));
@@ -571,6 +702,9 @@ void VocoderModel::vocode_streaming(
     // the edges of each chunk.
 
     int overlap = 64; // Conservative overlap for this vocoder
+#if defined(INFLECT_LOW_MEMORY)
+    overlap = 8;
+#endif
     if (chunk_frames <= overlap) {
         auto audio = vocode(mel, n_mels, n_frames, backend);
         callback(audio.data(), audio.size());
@@ -578,13 +712,16 @@ void VocoderModel::vocode_streaming(
     }
     int hop = chunk_frames - overlap;
     int upsample = total_upsample();
+    std::vector<float> mel_chunk;
+    mel_chunk.reserve(n_mels * chunk_frames);
+    std::vector<float> audio_chunk;
 
     for (int start = 0; start < n_frames; start += hop) {
         int end = std::min(start + chunk_frames, n_frames);
         int chunk_len = end - start;
 
         // Extract mel chunk
-        std::vector<float> mel_chunk(n_mels * chunk_len);
+        mel_chunk.resize(n_mels * chunk_len);
         for (int m = 0; m < n_mels; m++) {
             for (int t = 0; t < chunk_len; t++) {
                 mel_chunk[m + n_mels * t] = mel[m + n_mels * (start + t)];
@@ -592,7 +729,7 @@ void VocoderModel::vocode_streaming(
         }
 
         // Vocode chunk
-        auto audio_chunk = vocode(mel_chunk, n_mels, chunk_len, backend);
+        audio_chunk = vocode(mel_chunk, n_mels, chunk_len, backend);
 
         // Determine which samples to output (discard overlap region)
         int discard_start = (start > 0) ? overlap * upsample / 2 : 0;
@@ -602,6 +739,9 @@ void VocoderModel::vocode_streaming(
 
         if (out_end > out_start) {
             callback(audio_chunk.data() + out_start, out_end - out_start);
+        }
+        if (end >= n_frames) {
+            break;
         }
     }
 }

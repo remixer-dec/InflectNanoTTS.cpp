@@ -3,6 +3,7 @@
 #include "vocoder_model.h"
 #include "text_frontend.h"
 #include "model_loader.h"
+#include "memory_trace.h"
 #include "utils.h"
 #include <ggml-cpu.h>
 #include <cstdio>
@@ -83,6 +84,7 @@ void Synthesizer::init_backend(int n_threads) {
             n_threads > 0 ? n_threads : (int)std::thread::hardware_concurrency());
     }
     fprintf(stderr, "[Synthesizer] Backend initialized\n");
+    mem_trace_rss("after backend init");
 }
 
 void Synthesizer::free_backend() {
@@ -93,7 +95,6 @@ void Synthesizer::free_backend() {
 }
 
 Synthesizer::Synthesizer() {
-    work_mem_.resize(WORK_MEM_SIZE);
     init_backend();
 }
 
@@ -122,10 +123,25 @@ bool Synthesizer::load_acoustic(const std::string& path) {
     cfg.postnet_scale  = acoustic_loader_->get_f32("postnet_scale", 0.1f);
 
     acoustic_ = std::make_unique<AcousticModel>(cfg);
-    return acoustic_->load(*acoustic_loader_);
+    const bool ok = acoustic_->load(*acoustic_loader_);
+    mem_trace_rss("after acoustic load");
+    return ok;
 }
 
 bool Synthesizer::load_vocoder(const std::string& path) {
+#if defined(INFLECT_LOW_MEMORY)
+    deferred_vocoder_path_ = path;
+    vocoder_.reset();
+    vocoder_loader_.reset();
+    fprintf(stderr, "[Synthesizer] Deferred vocoder load for low-memory mode\n");
+    mem_trace_rss("after vocoder defer");
+    return true;
+#else
+    return load_vocoder_now(path);
+#endif
+}
+
+bool Synthesizer::load_vocoder_now(const std::string& path) {
     vocoder_loader_ = std::make_unique<ModelLoader>();
     if (!vocoder_loader_->load(path)) return false;
 
@@ -136,12 +152,16 @@ bool Synthesizer::load_vocoder(const std::string& path) {
     cfg.activation  = vocoder_loader_->get_string("activation", "snake");
 
     vocoder_ = std::make_unique<VocoderModel>(cfg);
-    return vocoder_->load(*vocoder_loader_);
+    const bool ok = vocoder_->load(*vocoder_loader_);
+    mem_trace_rss("after vocoder load");
+    return ok;
 }
 
 bool Synthesizer::load_cmudict(const std::string& path) {
     frontend_ = std::make_unique<TextFrontend>();
-    return frontend_->load_cmudict(path);
+    const bool ok = frontend_->load_cmudict(path);
+    mem_trace_rss("after cmudict load");
+    return ok;
 }
 
 TokenSequence Synthesizer::text_to_tokens(const std::string& text) {
@@ -160,7 +180,7 @@ std::vector<float> Synthesizer::synthesize(
     std::vector<float> audio;
     synthesize_streaming(text, params, [&](const float* samples, size_t n) {
         audio.insert(audio.end(), samples, samples + n);
-    }, 0);
+    }, params.vocoder_chunk_frames);
 
     const std::string dump_dir = debug_dump_dir();
     if (!dump_dir.empty()) {
@@ -209,6 +229,7 @@ void Synthesizer::synthesize_streaming(
         tokens.phone_ids, tokens.tone_ids, tokens.lang_ids,
         params.speaker_id, g_backend
     );
+    mem_trace_rss("after encoder");
 
     fprintf(stderr, "[Synthesizer] Encoder done: %d frames predicted\n",
             enc_out.seq_len);
@@ -239,6 +260,7 @@ void Synthesizer::synthesize_streaming(
     auto features = acoustic_->length_regulate(
         enc_out, params.length_scale, params.pitch_scale, params.energy_scale
     );
+    mem_trace_rss("after length regulation");
 
     fprintf(stderr, "[Synthesizer] Length regulated: %d frames\n",
             features.n_frames);
@@ -252,10 +274,25 @@ void Synthesizer::synthesize_streaming(
 
     // ── 4. Graph 2: Decoder → Mel ───────────────────────────────────
     auto mel = acoustic_->run_decoder(features, g_backend);
-
-    fprintf(stderr, "[Synthesizer] Mel generated: %zu values\n", mel.size());
+    mem_trace_rss("after decoder");
     int n_mels = acoustic_->config().n_mels;
     int n_frames = features.n_frames;
+
+#if defined(INFLECT_LOW_MEMORY)
+    enc_out = EncoderOutput{};
+    features = RegulatedFeatures{};
+    acoustic_.reset();
+    acoustic_loader_.reset();
+    mem_trace_rss("after acoustic release");
+    if (!vocoder_ && !deferred_vocoder_path_.empty()) {
+        if (!load_vocoder_now(deferred_vocoder_path_)) {
+            fprintf(stderr, "[Synthesizer] Failed to load deferred vocoder\n");
+            return;
+        }
+    }
+#endif
+
+    fprintf(stderr, "[Synthesizer] Mel generated: %zu values\n", mel.size());
     if (!dump_dir.empty()) {
         debug_save_f32(dump_dir, "mel",
                        debug_transpose_2d(mel, n_mels, n_frames),
@@ -266,6 +303,7 @@ void Synthesizer::synthesize_streaming(
     vocoder_->vocode_streaming(
         mel, n_mels, n_frames, vocoder_chunk_frames, g_backend, callback
     );
+    mem_trace_rss("after vocoder");
 }
 
 } // namespace inflect

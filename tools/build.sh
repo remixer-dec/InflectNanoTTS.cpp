@@ -42,6 +42,10 @@ COMMON_FLAGS=(
   -I"${ROOT_DIR}/ggml/src/ggml-cpu"
 )
 
+if [[ "${INFLECT_LOW_MEMORY:-0}" == "1" ]]; then
+  COMMON_FLAGS+=(-DINFLECT_LOW_MEMORY)
+fi
+
 case "${os_name}" in
   Linux*) COMMON_FLAGS+=(-D_GNU_SOURCE -D_XOPEN_SOURCE=600) ;;
   Darwin*) COMMON_FLAGS+=(-D_DARWIN_C_SOURCE) ;;
