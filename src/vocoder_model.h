@@ -31,11 +31,14 @@ struct VocoderWeights {
 };
 
 struct QuantConvTranspose1dOpData {
+    const char* profile_label;
     int kernel_size;
     int stride;
+    int crop_left;
 };
 
 struct VocoderQuantConv1dOpData {
+    const char* profile_label;
     int kernel_size;
     int stride;
     int padding;
@@ -95,7 +98,8 @@ private:
         ggml_context* gctx,
         ggml_tensor* x,
         const ResBlockWeights& w,
-        int kernel_size
+        int kernel_size,
+        int max_depth
     );
 
     ggml_cgraph* build_vocoder_graph(

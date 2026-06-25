@@ -70,6 +70,7 @@ C_SOURCES=(
 CXX_SOURCES=(
   src/main.cpp
   src/synthesizer.cpp
+  src/griffin_lim_vocoder.cpp
   src/model_loader.cpp
   src/acoustic_model.cpp
   src/vocoder_model.cpp

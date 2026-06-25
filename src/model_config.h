@@ -6,6 +6,10 @@
 #include <vector>
 #include <functional>
 
+#ifndef INFLECT_GRIFFIN_LIM_ITERS
+#define INFLECT_GRIFFIN_LIM_ITERS 8
+#endif
+
 namespace inflect {
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -61,6 +65,8 @@ struct SynthParams {
     int   speaker_id   = 0;
     uint64_t seed      = 1234;
     int   vocoder_chunk_frames = 0;
+    std::string vocoder_backend;
+    int griffin_lim_iterations = INFLECT_GRIFFIN_LIM_ITERS;
 };
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "inflect-nano.h"
+
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <cstdio>
@@ -58,6 +60,10 @@ inline void mem_trace_rss(const char* label) {
         std::fprintf(stderr, "[mem] %s rss=%zu KB (%.2f MB)\n",
                      label, rss_kb, rss_kb / 1024.0);
     }
+}
+
+inline void mem_trace_heap(const char* label) {
+    runtime_trace_heap(label);
 }
 
 inline void mem_release_to_os() {

@@ -1,4 +1,5 @@
 #include "model_loader.h"
+#include "inflect-nano.h"
 #include "memory_trace.h"
 #include <ggml-cpu.h>
 #include <algorithm>
@@ -64,7 +65,7 @@ bool ModelLoader::load_selected(const std::string& path, const std::vector<std::
     }
 
     // ── 3. Allocate CPU backend storage for selected weight tensors ─
-    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+    ggml_backend_buffer_type_t buft = runtime_weight_buffer_type();
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
     size_t total_alloc = 0;
     int selected_count = 0;
@@ -107,7 +108,7 @@ bool ModelLoader::load_selected(const std::string& path, const std::vector<std::
     }
 
     size_t total_size = 0;
-    std::vector<uint8_t> data(64 * 1024);
+    std::vector<uint8_t> data(8 * 1024);
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(gguf_, i);
         if (!selected_tensor(name, selected_prefixes)) continue;

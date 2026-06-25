@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Compiles the text-based cmudict.rep into a compressed, binary cmudict.bin
-for zero-RAM lookup on microcontrollers."""
+"""Compiles cmudict.rep into cmudict.bin and writes a sparse lookup index."""
 
 import os
 import re
@@ -54,9 +53,75 @@ def process_syllables(syllables_str):
 # 3. Main Compilation
 # ─────────────────────────────────────────────────────────────────────────
 
+def write_index_records(records, index_path, total_count, stride=256):
+    with open(index_path, "wb") as f:
+        f.write(b"CMY1")
+        index_count = len(records)
+        f.write(struct.pack("<III", stride, total_count, index_count))
+        for entry_index, offset, word in records:
+            word_bytes = word.encode("ascii")
+            f.write(struct.pack("<IQB", entry_index, offset, len(word_bytes)))
+            f.write(word_bytes)
+
+
+def write_index(entries, index_path, stride=256):
+    records = []
+    offset = 8  # CMD2 magic + entry count.
+    for entry_index, (word, phns) in enumerate(entries):
+        if entry_index % stride == 0:
+            records.append((entry_index, offset, word))
+        offset += 1 + len(word.encode("ascii")) + 1 + 2 * len(phns)
+    write_index_records(records, index_path, len(entries), stride)
+
+
+def write_index_from_bin(bin_path, index_path, stride=256):
+    records = []
+    with open(bin_path, "rb") as f:
+        marker = f.read(4)
+        if len(marker) != 4:
+            raise ValueError(f"{bin_path}: invalid header")
+        if marker == b"CMD2":
+            raw_count = f.read(4)
+            if len(raw_count) != 4:
+                raise ValueError(f"{bin_path}: invalid CMD2 count")
+            count = struct.unpack("<I", raw_count)[0]
+        else:
+            count = struct.unpack("<I", marker)[0]
+
+        for entry_index in range(count):
+            offset = f.tell()
+            raw_word_len = f.read(1)
+            if len(raw_word_len) != 1:
+                raise ValueError(f"{bin_path}: truncated word length at entry {entry_index}")
+            word_len = raw_word_len[0]
+            word = f.read(word_len).decode("ascii")
+            raw_phone_count = f.read(1)
+            if len(raw_phone_count) != 1:
+                raise ValueError(f"{bin_path}: truncated phone count at entry {entry_index}")
+            phone_count = raw_phone_count[0]
+            f.seek(2 * phone_count, os.SEEK_CUR)
+            if entry_index % stride == 0:
+                records.append((entry_index, offset, word))
+
+    write_index_records(records, index_path, count, stride)
+    return count, len(records)
+
+
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--index-only":
+        bin_path = sys.argv[2]
+        index_path = sys.argv[3] if len(sys.argv) >= 4 else os.path.splitext(bin_path)[0] + ".idx"
+        count, index_count = write_index_from_bin(bin_path, index_path)
+        index_size = os.path.getsize(index_path)
+        print(
+            f"Wrote sparse index for {count} words, {index_count} entries "
+            f"to {index_path} ({index_size/1024:.1f} KB)"
+        )
+        return
+
     if len(sys.argv) < 3:
         print("Usage: python compile_cmudict.py <cmudict.rep> <cmudict.bin>")
+        print("       python compile_cmudict.py --index-only <cmudict.bin> [cmudict.idx]")
         sys.exit(1)
 
     in_path = sys.argv[1]
@@ -127,6 +192,11 @@ def main():
 
     out_size = os.path.getsize(out_path)
     print(f"Compiled {len(unique_entries)} words to {out_path} ({out_size/1024:.1f} KB)")
+
+    index_path = os.path.splitext(out_path)[0] + ".idx"
+    write_index(unique_entries, index_path)
+    index_size = os.path.getsize(index_path)
+    print(f"Wrote sparse index to {index_path} ({index_size/1024:.1f} KB)")
 
 if __name__ == "__main__":
     main()

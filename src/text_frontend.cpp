@@ -32,6 +32,21 @@ static bool starts_with_at(const std::string& s, size_t pos, const char* needle)
     return pos + n <= s.size() && std::memcmp(s.data() + pos, needle, n) == 0;
 }
 
+static std::string cmudict_index_path(const std::string& path) {
+    const std::string suffix = ".bin";
+    if (path.size() >= suffix.size() &&
+        path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        return path.substr(0, path.size() - suffix.size()) + ".idx";
+    }
+    return path + ".idx";
+}
+
+template <typename T>
+static bool read_exact(std::ifstream& f, T& value) {
+    f.read(reinterpret_cast<char*>(&value), sizeof(value));
+    return f.gcount() == static_cast<std::streamsize>(sizeof(value));
+}
+
 static bool cleanup_punctuation_at(const std::string& s, size_t pos, size_t& len) {
     if (starts_with_at(s, pos, "\u2026")) {
         len = std::strlen("\u2026");
@@ -163,8 +178,8 @@ bool TextFrontend::load_cmudict(const std::string& path) {
         f.read(reinterpret_cast<char*>(&word_len), 1);
         if (f.gcount() < 1) break;
 
-        std::string word(word_len, '\0');
-        f.read(&word[0], word_len);
+        std::string entry_word_text(word_len, '\0');
+        f.read(&entry_word_text[0], word_len);
 
         uint8_t n_phones;
         f.read(reinterpret_cast<char*>(&n_phones), 1);
@@ -174,7 +189,7 @@ bool TextFrontend::load_cmudict(const std::string& path) {
         entry.phone_offset = static_cast<uint32_t>(dict_phones_.size());
         entry.word_len = word_len;
         entry.phone_count = n_phones;
-        dict_words_.append(word);
+        dict_words_.append(entry_word_text);
         for (int i = 0; i < n_phones; i++) {
             uint8_t phone_id = 0;
             uint8_t tone = 0;
@@ -197,7 +212,12 @@ bool TextFrontend::load_cmudict(const std::string& path) {
 }
 
 bool TextFrontend::load_cmudict_sparse_index(std::ifstream& f, uint32_t count) {
+    if (load_cmudict_sidecar_index(count)) {
+        return true;
+    }
+
     constexpr uint32_t kIndexStride = 256;
+    sparse_stride_ = kIndexStride;
     dict_.clear();
     dict_words_.clear();
     dict_phones_.clear();
@@ -212,8 +232,8 @@ bool TextFrontend::load_cmudict_sparse_index(std::ifstream& f, uint32_t count) {
         f.read(reinterpret_cast<char*>(&word_len), 1);
         if (f.gcount() < 1) break;
 
-        std::string word(word_len, '\0');
-        f.read(&word[0], word_len);
+        char entry_word_text[256];
+        f.read(entry_word_text, word_len);
 
         uint8_t n_phones = 0;
         f.read(reinterpret_cast<char*>(&n_phones), 1);
@@ -225,12 +245,83 @@ bool TextFrontend::load_cmudict_sparse_index(std::ifstream& f, uint32_t count) {
             entry.word_len = word_len;
             entry.offset = entry_offset;
             entry.entry_index = entry_idx;
-            sparse_words_.append(word);
+            sparse_words_.append(entry_word_text, word_len);
             sparse_index_.push_back(entry);
         }
     }
     flash_dict_.open(dict_path_, std::ios::binary);
     return !sparse_index_.empty();
+}
+
+bool TextFrontend::load_cmudict_sidecar_index(uint32_t count) {
+    const std::string index_path = cmudict_index_path(dict_path_);
+    std::ifstream index(index_path, std::ios::binary);
+    if (!index.is_open()) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t stride = 0;
+    uint32_t sidecar_count = 0;
+    uint32_t index_count = 0;
+    constexpr uint32_t kIndexMagic = 0x31594d43; // "CMY1", little-endian
+    if (!read_exact(index, magic) || magic != kIndexMagic ||
+        !read_exact(index, stride) || stride == 0 ||
+        !read_exact(index, sidecar_count) || sidecar_count != count ||
+        !read_exact(index, index_count) || index_count == 0) {
+        fprintf(stderr, "[TextFrontend] Ignoring invalid cmudict index: %s\n",
+                index_path.c_str());
+        return false;
+    }
+
+    dict_.clear();
+    dict_words_.clear();
+    dict_phones_.clear();
+    sparse_index_.clear();
+    sparse_words_.clear();
+    sparse_stride_ = stride;
+    sparse_index_.reserve(index_count);
+    sparse_words_.reserve(index_count * 8);
+
+    for (uint32_t i = 0; i < index_count; i++) {
+        SparseIndexEntry entry;
+        uint8_t word_len = 0;
+        if (!read_exact(index, entry.entry_index) ||
+            !read_exact(index, entry.offset) ||
+            !read_exact(index, word_len) ||
+            word_len == 0) {
+            fprintf(stderr, "[TextFrontend] Ignoring truncated cmudict index: %s\n",
+                    index_path.c_str());
+            sparse_index_.clear();
+            sparse_words_.clear();
+            return false;
+        }
+        char word[256];
+        index.read(word, word_len);
+        if (index.gcount() != static_cast<std::streamsize>(word_len)) {
+            fprintf(stderr, "[TextFrontend] Ignoring truncated cmudict index: %s\n",
+                    index_path.c_str());
+            sparse_index_.clear();
+            sparse_words_.clear();
+            return false;
+        }
+        entry.word_len = word_len;
+        entry.word_offset = static_cast<uint32_t>(sparse_words_.size());
+        sparse_words_.append(word, word_len);
+        sparse_index_.push_back(entry);
+    }
+
+    flash_dict_.open(dict_path_, std::ios::binary);
+    if (!flash_dict_.is_open()) {
+        sparse_index_.clear();
+        sparse_words_.clear();
+        return false;
+    }
+
+    fprintf(stderr,
+            "[TextFrontend] Loaded cmudict sidecar index entries=%u stride=%u path=%s\n",
+            index_count, stride, index_path.c_str());
+    return true;
 }
 
 std::string_view TextFrontend::dict_word(const DictEntry& entry) const {
@@ -278,7 +369,10 @@ bool TextFrontend::lookup_flash_entry(
     flash_dict_.clear();
     flash_dict_.seekg(static_cast<std::streamoff>(it->offset), std::ios::beg);
 
-    const uint32_t end_index = std::min<uint32_t>(it->entry_index + 256, dict_count_);
+    const uint32_t end_index = std::min<uint32_t>(
+        it->entry_index + sparse_stride_,
+        dict_count_
+    );
     for (uint32_t entry_idx = it->entry_index; entry_idx < end_index && flash_dict_.good(); entry_idx++) {
         uint8_t word_len = 0;
         flash_dict_.read(reinterpret_cast<char*>(&word_len), 1);

@@ -1,5 +1,6 @@
 #include "inflect-nano.h"
 #include "acoustic_model.h"
+#include "griffin_lim_vocoder.h"
 #include "vocoder_model.h"
 #include "text_frontend.h"
 #include "model_loader.h"
@@ -8,18 +9,123 @@
 #include <ggml-cpu.h>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <cctype>
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
+#include <vector>
+
+#ifndef INFLECT_VOCODER_BACKEND
+#define INFLECT_VOCODER_BACKEND neural
+#endif
+
+#ifndef INFLECT_ACOUSTIC_SKIP_POSTNET
+#define INFLECT_ACOUSTIC_SKIP_POSTNET 0
+#endif
+
+#define INFLECT_STRINGIFY_IMPL(x) #x
+#define INFLECT_STRINGIFY(x) INFLECT_STRINGIFY_IMPL(x)
 
 namespace inflect {
 
 static ggml_backend_t g_backend = nullptr;
+static RuntimeConfig g_runtime_config;
+
+static uint32_t default_now_ms() {
+    using clock = std::chrono::steady_clock;
+    return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        clock::now().time_since_epoch()).count();
+}
+
+void configure_runtime(const RuntimeConfig& config) {
+    g_runtime_config = config;
+}
+
+const RuntimeConfig& runtime_config() {
+    return g_runtime_config;
+}
+
+ggml_backend_buffer_type_t runtime_weight_buffer_type() {
+    if (g_runtime_config.weight_buffer_type) {
+        ggml_backend_buffer_type_t buft = g_runtime_config.weight_buffer_type();
+        if (buft) {
+            return buft;
+        }
+    }
+    return ggml_backend_cpu_buffer_type();
+}
+
+uint32_t runtime_now_ms() {
+    return g_runtime_config.now_ms ? g_runtime_config.now_ms() : default_now_ms();
+}
+
+void* runtime_alloc_scratch(size_t bytes, ScratchMemoryKind kind) {
+    if (g_runtime_config.scratch_alloc) {
+        return g_runtime_config.scratch_alloc(bytes, kind);
+    }
+    (void)kind;
+    return std::malloc(bytes);
+}
+
+void runtime_free_scratch(void* ptr) {
+    if (!ptr) {
+        return;
+    }
+    if (g_runtime_config.scratch_free) {
+        g_runtime_config.scratch_free(ptr);
+        return;
+    }
+    std::free(ptr);
+}
+
+void runtime_trace_heap(const char* label) {
+    if (g_runtime_config.trace_heap) {
+        g_runtime_config.trace_heap(label);
+    }
+}
+
+const char* runtime_backend_label() {
+    return (g_runtime_config.backend_label && g_runtime_config.backend_label[0])
+               ? g_runtime_config.backend_label
+               : "scalar";
+}
 
 static std::string debug_dump_dir() {
     const char* dir = std::getenv("INFLECT_DUMP_DIR");
     return (dir && dir[0]) ? std::string(dir) : std::string();
+}
+
+static std::string normalize_selector(std::string value) {
+    if (value.size() >= 2 &&
+        ((value.front() == '"' && value.back() == '"') ||
+         (value.front() == '\'' && value.back() == '\''))) {
+        value = value.substr(1, value.size() - 2);
+    }
+    for (char& c : value) {
+        c = (char)std::tolower((unsigned char)c);
+        if (c == '-') c = '_';
+    }
+    return value;
+}
+
+static std::string build_vocoder_backend() {
+    return normalize_selector(INFLECT_STRINGIFY(INFLECT_VOCODER_BACKEND));
+}
+
+static std::string selected_vocoder_backend(const SynthParams& params) {
+    std::string backend = normalize_selector(params.vocoder_backend);
+    if (backend.empty()) {
+        backend = build_vocoder_backend();
+    }
+    if (backend != "neural" && backend != "griffin_lim") {
+        fprintf(stderr,
+                "[Synthesizer] Unsupported vocoder backend=%s; falling back to neural\n",
+                backend.c_str());
+        backend = "neural";
+    }
+    return backend;
 }
 
 static void ensure_debug_dir(const std::string& dir) {
@@ -79,12 +185,28 @@ void Synthesizer::init_backend(int n_threads) {
         fprintf(stderr, "[Synthesizer] Failed to init backend\n");
         return;
     }
-    if (ggml_backend_is_cpu(g_backend)) {
-        ggml_backend_cpu_set_n_threads(g_backend,
-            n_threads > 0 ? n_threads : (int)std::thread::hardware_concurrency());
+    int threads = n_threads;
+    if (threads <= 0) {
+        threads = (int)std::thread::hardware_concurrency();
+        if (threads <= 0) {
+            threads = 1;
+        }
     }
-    fprintf(stderr, "[Synthesizer] Backend initialized\n");
+    if (ggml_backend_is_cpu(g_backend)) {
+        ggml_backend_cpu_set_n_threads(g_backend, threads);
+    }
+    fprintf(stderr, "[Synthesizer] Backend initialized threads=%d simd=%s\n",
+            threads,
+            runtime_backend_label());
     mem_trace_rss("after backend init");
+}
+
+void Synthesizer::set_backend_threads(int n_threads) {
+    if (!g_backend || !ggml_backend_is_cpu(g_backend) || n_threads <= 0) {
+        return;
+    }
+    ggml_backend_cpu_set_n_threads(g_backend, n_threads);
+    fprintf(stderr, "[Synthesizer] Backend threads set=%d\n", n_threads);
 }
 
 void Synthesizer::free_backend() {
@@ -103,7 +225,17 @@ Synthesizer::~Synthesizer() = default;
 bool Synthesizer::load_acoustic(const std::string& path) {
     acoustic_path_ = path;
     acoustic_loader_ = std::make_unique<ModelLoader>();
+#if defined(INFLECT_LOW_MEMORY)
+    static const std::vector<std::string> encoder_prefixes = {
+        "phone.", "tone.", "lang.", "speaker.weight", "speaker_proj.",
+        "encoder.", "duration_head.", "energy_head.", "bright_head.",
+        "pitch_head.", "energy_proj.", "bright_proj.", "pitch_proj.",
+        "abs_frame.", "frame_proj.", "local_ctx.",
+    };
+    if (!acoustic_loader_->load_selected(path, encoder_prefixes)) return false;
+#else
     if (!acoustic_loader_->load(path)) return false;
+#endif
 
     AcousticConfig cfg;
     cfg.vocab_size     = acoustic_loader_->get_i32("vocab_size", 256);
@@ -125,7 +257,11 @@ bool Synthesizer::load_acoustic(const std::string& path) {
     acoustic_config_ = cfg;
 
     acoustic_ = std::make_unique<AcousticModel>(cfg);
+#if defined(INFLECT_LOW_MEMORY)
+    const bool ok = acoustic_->load_encoder(*acoustic_loader_);
+#else
     const bool ok = acoustic_->load(*acoustic_loader_);
+#endif
     mem_trace_rss("after acoustic load");
     return ok;
 }
@@ -189,7 +325,11 @@ std::vector<float> Synthesizer::synthesize(
         debug_save_f32(dump_dir, "audio_raw", audio, "[" + std::to_string(audio.size()) + "]");
     }
 
-    normalize_audio(audio);
+    if (selected_vocoder_backend(params) == "griffin_lim") {
+        fprintf(stderr, "[Synthesizer] Global audio normalization skipped backend=griffin_lim\n");
+    } else {
+        normalize_audio(audio);
+    }
 
     if (!dump_dir.empty()) {
         debug_save_f32(dump_dir, "audio_normalized", audio, "[" + std::to_string(audio.size()) + "]");
@@ -204,6 +344,10 @@ void Synthesizer::synthesize_streaming(
     AudioCallback callback,
     int vocoder_chunk_frames
 ) {
+    const uint32_t synth_start_ms = runtime_now_ms();
+    uint32_t stage_start_ms = synth_start_ms;
+    const std::string vocoder_backend = selected_vocoder_backend(params);
+    fprintf(stderr, "[Synthesizer] Vocoder backend=%s\n", vocoder_backend.c_str());
     const std::string dump_dir = debug_dump_dir();
     if (!dump_dir.empty()) {
         ensure_debug_dir(dump_dir);
@@ -218,7 +362,11 @@ void Synthesizer::synthesize_streaming(
         return;
     }
 
-    fprintf(stderr, "[Synthesizer] %zu tokens\n", tokens.phone_ids.size());
+    fprintf(stderr, "[Synthesizer] %zu tokens text_ms=%u total_ms=%u\n",
+            tokens.phone_ids.size(),
+            (unsigned)(runtime_now_ms() - stage_start_ms),
+            (unsigned)(runtime_now_ms() - synth_start_ms));
+    stage_start_ms = runtime_now_ms();
     if (!dump_dir.empty()) {
         const std::string shape = "[" + std::to_string(tokens.phone_ids.size()) + "]";
         debug_save_i32(dump_dir, "phone_ids", tokens.phone_ids, shape);
@@ -235,9 +383,13 @@ void Synthesizer::synthesize_streaming(
     mem_release_to_os();
 #endif
     mem_trace_rss("after encoder");
+    mem_trace_heap("after encoder");
 
-    fprintf(stderr, "[Synthesizer] Encoder done: %d frames predicted\n",
-            enc_out.seq_len);
+    fprintf(stderr, "[Synthesizer] Encoder done: %d frames predicted stage_ms=%u total_ms=%u\n",
+            enc_out.seq_len,
+            (unsigned)(runtime_now_ms() - stage_start_ms),
+            (unsigned)(runtime_now_ms() - synth_start_ms));
+    stage_start_ms = runtime_now_ms();
     if (!dump_dir.empty()) {
         debug_save_f32(dump_dir, "encoded",
                        debug_transpose_2d(enc_out.encoded, enc_out.hidden, enc_out.seq_len),
@@ -269,9 +421,13 @@ void Synthesizer::synthesize_streaming(
     mem_release_to_os();
 #endif
     mem_trace_rss("after length regulation");
+    mem_trace_heap("after length regulation");
 
-    fprintf(stderr, "[Synthesizer] Length regulated: %d frames\n",
-            features.n_frames);
+    fprintf(stderr, "[Synthesizer] Length regulated: %d frames stage_ms=%u total_ms=%u\n",
+            features.n_frames,
+            (unsigned)(runtime_now_ms() - stage_start_ms),
+            (unsigned)(runtime_now_ms() - synth_start_ms));
+    stage_start_ms = runtime_now_ms();
     if (!dump_dir.empty()) {
         debug_save_i32(dump_dir, "durations", features.durations,
                        "[" + std::to_string(features.durations.size()) + "]");
@@ -288,7 +444,11 @@ void Synthesizer::synthesize_streaming(
     mem_trace_rss("after acoustic encoder release");
 
     acoustic_loader_ = std::make_unique<ModelLoader>();
-    if (!acoustic_loader_->load_selected(acoustic_path_, {"decoder.", "frame_gru.", "mel_head.", "postnet."})) {
+    std::vector<std::string> decoder_prefixes = {"decoder.", "frame_gru.", "mel_head."};
+#if !INFLECT_ACOUSTIC_SKIP_POSTNET
+    decoder_prefixes.push_back("postnet.");
+#endif
+    if (!acoustic_loader_->load_selected(acoustic_path_, decoder_prefixes)) {
         fprintf(stderr, "[Synthesizer] Failed to reload decoder-only acoustic model\n");
         return;
     }
@@ -298,13 +458,30 @@ void Synthesizer::synthesize_streaming(
         return;
     }
     mem_trace_rss("after acoustic decoder reload");
+    mem_trace_heap("after acoustic decoder reload");
+    fprintf(stderr, "[Synthesizer] Acoustic decoder reloaded stage_ms=%u total_ms=%u\n",
+            (unsigned)(runtime_now_ms() - stage_start_ms),
+            (unsigned)(runtime_now_ms() - synth_start_ms));
+    stage_start_ms = runtime_now_ms();
 #endif
 
     // ── 4. Graph 2: Decoder → Mel ───────────────────────────────────
     auto mel = acoustic_->run_decoder(features, g_backend);
     mem_trace_rss("after decoder");
+    mem_trace_heap("after decoder");
     int n_mels = acoustic_->config().n_mels;
     int n_frames = features.n_frames;
+
+    fprintf(stderr, "[Synthesizer] Mel generated: %zu values stage_ms=%u total_ms=%u\n",
+            mel.size(),
+            (unsigned)(runtime_now_ms() - stage_start_ms),
+            (unsigned)(runtime_now_ms() - synth_start_ms));
+    stage_start_ms = runtime_now_ms();
+    if (!dump_dir.empty()) {
+        debug_save_f32(dump_dir, "mel",
+                       debug_transpose_2d(mel, n_mels, n_frames),
+                       "[" + std::to_string(n_mels) + "," + std::to_string(n_frames) + "]");
+    }
 
 #if defined(INFLECT_LOW_MEMORY)
     features = RegulatedFeatures{};
@@ -312,26 +489,44 @@ void Synthesizer::synthesize_streaming(
     acoustic_loader_.reset();
     mem_release_to_os();
     mem_trace_rss("after acoustic release");
-    if (!vocoder_ && !deferred_vocoder_path_.empty()) {
+    mem_trace_heap("after acoustic release");
+    if (vocoder_backend == "griffin_lim") {
+        fprintf(stderr, "[Synthesizer] Vocoder model load skipped backend=griffin_lim\n");
+    } else if (!vocoder_ && !deferred_vocoder_path_.empty()) {
         if (!load_vocoder_now(deferred_vocoder_path_)) {
             fprintf(stderr, "[Synthesizer] Failed to load deferred vocoder\n");
             return;
         }
     }
+    mem_trace_heap("after vocoder ready");
+    fprintf(stderr, "[Synthesizer] Vocoder ready stage_ms=%u total_ms=%u\n",
+            (unsigned)(runtime_now_ms() - stage_start_ms),
+            (unsigned)(runtime_now_ms() - synth_start_ms));
+    stage_start_ms = runtime_now_ms();
 #endif
 
-    fprintf(stderr, "[Synthesizer] Mel generated: %zu values\n", mel.size());
-    if (!dump_dir.empty()) {
-        debug_save_f32(dump_dir, "mel",
-                       debug_transpose_2d(mel, n_mels, n_frames),
-                       "[" + std::to_string(n_mels) + "," + std::to_string(n_frames) + "]");
-    }
-
     // ── 5. Graph 3: Vocoder → Audio ─────────────────────────────────
-    vocoder_->vocode_streaming(
-        mel, n_mels, n_frames, vocoder_chunk_frames, g_backend, callback
-    );
+    if (vocoder_backend == "griffin_lim") {
+        GriffinLimConfig gl_cfg;
+        gl_cfg.sample_rate = acoustic_config_.sample_rate;
+        gl_cfg.n_mels = n_mels;
+        gl_cfg.iterations = params.griffin_lim_iterations;
+        gl_cfg.seed = params.seed;
+        griffin_lim_vocode_streaming(mel, n_mels, n_frames, gl_cfg, callback);
+    } else {
+        if (!vocoder_) {
+            fprintf(stderr, "[Synthesizer] Vocoder not loaded\n");
+            return;
+        }
+        vocoder_->vocode_streaming(
+            mel, n_mels, n_frames, vocoder_chunk_frames, g_backend, callback
+        );
+    }
     mem_trace_rss("after vocoder");
+    mem_trace_heap("after vocoder");
+    fprintf(stderr, "[Synthesizer] Vocoder done stage_ms=%u total_ms=%u\n",
+            (unsigned)(runtime_now_ms() - stage_start_ms),
+            (unsigned)(runtime_now_ms() - synth_start_ms));
 }
 
 } // namespace inflect

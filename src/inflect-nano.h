@@ -4,11 +4,36 @@
 #include <ggml-backend.h>
 #include <ggml-alloc.h>
 #include "model_config.h"
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace inflect {
+
+enum class ScratchMemoryKind {
+    Default,
+    Psram,
+    InternalPreferred,
+};
+
+struct RuntimeConfig {
+    ggml_backend_buffer_type_t (*weight_buffer_type)() = nullptr;
+    uint32_t (*now_ms)() = nullptr;
+    void* (*scratch_alloc)(size_t bytes, ScratchMemoryKind kind) = nullptr;
+    void (*scratch_free)(void* ptr) = nullptr;
+    void (*trace_heap)(const char* label) = nullptr;
+    const char* backend_label = nullptr;
+};
+
+void configure_runtime(const RuntimeConfig& config);
+const RuntimeConfig& runtime_config();
+ggml_backend_buffer_type_t runtime_weight_buffer_type();
+uint32_t runtime_now_ms();
+void* runtime_alloc_scratch(size_t bytes, ScratchMemoryKind kind);
+void runtime_free_scratch(void* ptr);
+void runtime_trace_heap(const char* label);
+const char* runtime_backend_label();
 
 // ─────────────────────────────────────────────────────────────────────────
 // Main synthesizer
@@ -53,6 +78,7 @@ public:
 
     // Backend management
     static void init_backend(int n_threads = -1);
+    static void set_backend_threads(int n_threads);
     static void free_backend();
 
 private:

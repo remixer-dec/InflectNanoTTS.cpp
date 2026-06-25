@@ -1,0 +1,362 @@
+diff --git a/src/ggml-cpu/ggml-cpu-impl.h b/src/ggml-cpu/ggml-cpu-impl.h
+index 5d1ca5ff..20347f5a 100644
+--- a/src/ggml-cpu/ggml-cpu-impl.h
++++ b/src/ggml-cpu/ggml-cpu-impl.h
+@@ -1,4 +1,6 @@
+ #pragma once
++#ifndef INFLECT_GGML_CPU_IMPL_H
++#define INFLECT_GGML_CPU_IMPL_H
+ 
+ // GGML CPU internal header
+ 
+@@ -537,3 +539,5 @@ int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+ #ifdef __cplusplus
+ }
+ #endif
++
++#endif // INFLECT_GGML_CPU_IMPL_H
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index eb8341c9..49dfcb5c 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -76,11 +76,13 @@
+ #define UNUSED GGML_UNUSED
+ #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
+ 
++#ifndef INFLECT_LOW_MEMORY
+ // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
+ float ggml_table_f32_f16[1 << 16];
+ 
+ // precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
+ float ggml_table_f32_e8m0_half[1 << 8];
++#endif
+ 
+ #if defined(__ARM_ARCH)
+ struct ggml_arm_arch_features_type {
+@@ -3779,6 +3781,7 @@ void ggml_cpu_init(void) {
+ 
+     if (is_first_call) {
+         // initialize GELU, Quick GELU, SILU and EXP F32 tables
++#ifndef INFLECT_LOW_MEMORY
+         {
+             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
+ 
+@@ -3801,24 +3804,27 @@ void ggml_cpu_init(void) {
+             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
+ 
+             GGML_PRINT_DEBUG("%s: GELU, Quick GELU, SILU and EXP tables initialized in %f ms\n", __func__, (t_end - t_start)/1000.0);
++        }
++#else
++        GGML_PRINT_DEBUG("%s: low-memory mode uses computed f16/GELU conversions\n", __func__);
++#endif
+ 
+ #ifdef GGML_USE_OPENMP
+-            //if (!getenv("OMP_WAIT_POLICY")) {
+-            //    // set the wait policy to active, so that OpenMP threads don't sleep
+-            //    setenv("OMP_WAIT_POLICY", "active", 0)
+-            //}
+-
+-            if (!getenv("KMP_BLOCKTIME")) {
+-                // set the time to wait before sleeping a thread
+-                // this is less aggressive than setting the wait policy to active, but should achieve similar results in most cases
++        //if (!getenv("OMP_WAIT_POLICY")) {
++        //    // set the wait policy to active, so that OpenMP threads don't sleep
++        //    setenv("OMP_WAIT_POLICY", "active", 0)
++        //}
++
++        if (!getenv("KMP_BLOCKTIME")) {
++            // set the time to wait before sleeping a thread
++            // this is less aggressive than setting the wait policy to active, but should achieve similar results in most cases
+ #ifdef _WIN32
+-                _putenv_s("KMP_BLOCKTIME", "200"); // 200ms
++            _putenv_s("KMP_BLOCKTIME", "200"); // 200ms
+ #else
+-                setenv("KMP_BLOCKTIME", "200", 0); // 200ms
+-#endif
+-            }
++            setenv("KMP_BLOCKTIME", "200", 0); // 200ms
+ #endif
+         }
++#endif
+ 
+ #if defined(__ARM_ARCH)
+         ggml_init_arm_arch_features();
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+index 128883b4..924983a7 100644
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -7,6 +7,8 @@
+ #include "amx/amx.h"
+ 
+ #include <cctype>
++#include <cstdio>
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ 
+@@ -171,6 +173,10 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
++    if (const char * env = std::getenv("INFLECT_MEM_TRACE"); env && env[0] == '1') {
++        std::fprintf(stderr, "[mem] cpu graph work_size=%zu bytes (%.2f MB)\n",
++                     cplan.work_size, cplan.work_size / (1024.0 * 1024.0));
++    }
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+         delete[] cpu_ctx->work_data;
+@@ -187,7 +193,13 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
+     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
+     cplan.use_ref             = cpu_ctx->use_ref;
+ 
+-    return ggml_graph_compute(cgraph, &cplan);
++    enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
++#if defined(INFLECT_LOW_MEMORY)
++    delete[] cpu_ctx->work_data;
++    cpu_ctx->work_data = nullptr;
++    cpu_ctx->work_size = 0;
++#endif
++    return status;
+ }
+ 
+ static const struct ggml_backend_i ggml_backend_cpu_i = {
+diff --git a/src/ggml-cpu/simd-mappings.h b/src/ggml-cpu/simd-mappings.h
+index 62e68720..f00724cf 100644
+--- a/src/ggml-cpu/simd-mappings.h
++++ b/src/ggml-cpu/simd-mappings.h
+@@ -112,6 +112,7 @@ extern "C" {
+     #define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
+ #endif
+ 
++#ifndef INFLECT_LOW_MEMORY
+ // precomputed f32 table for f16 (256 KB)
+ // defined in ggml-cpu.c, initialized in ggml_cpu_init()
+ extern float ggml_table_f32_f16[1 << 16];
+@@ -119,9 +120,10 @@ extern float ggml_table_f32_f16[1 << 16];
+ // precomputed f32 table for e8m0 half (1 KB)
+ // defined in ggml-cpu.c, initialized in ggml_cpu_init()
+ extern float ggml_table_f32_e8m0_half[1 << 8];
++#endif
+ 
+ // Use lookup table for E8M0 on x86 (faster than bit manipulation)
+-#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
++#if !defined(INFLECT_LOW_MEMORY) && (defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__))
+ #define GGML_CPU_E8M0_TO_FP32_HALF(x) ggml_table_f32_e8m0_half[(uint8_t)(x)]
+ #else
+ #define GGML_CPU_E8M0_TO_FP32_HALF(x) GGML_E8M0_TO_FP32_HALF(x)
+@@ -132,9 +134,13 @@ extern float ggml_table_f32_e8m0_half[1 << 8];
+ // This is also true for POWER9.
+ #if !defined(GGML_CPU_FP16_TO_FP32)
+ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
++#ifdef INFLECT_LOW_MEMORY
++    return GGML_COMPUTE_FP16_TO_FP32(f);
++#else
+     uint16_t s;
+     memcpy(&s, &f, sizeof(uint16_t));
+     return ggml_table_f32_f16[s];
++#endif
+ }
+ 
+ #define GGML_CPU_FP16_TO_FP32(x) ggml_lookup_fp16_to_fp32(x)
+diff --git a/src/ggml-cpu/vec.cpp b/src/ggml-cpu/vec.cpp
+index 67b6b05c..da01246e 100644
+--- a/src/ggml-cpu/vec.cpp
++++ b/src/ggml-cpu/vec.cpp
+@@ -2,11 +2,13 @@
+ 
+ #include <cassert>
+ 
++#ifndef INFLECT_LOW_MEMORY
+ // precomputed gelu table for f16 (128 KB)
+ ggml_fp16_t ggml_table_gelu_f16[1 << 16];
+ 
+ // precomputed quick gelu table for f16 (128 KB)
+ ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
++#endif
+ 
+ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
+    assert(nrc == 1);
+diff --git a/src/ggml-cpu/vec.h b/src/ggml-cpu/vec.h
+index 5de9cb5b..e037adb1 100644
+--- a/src/ggml-cpu/vec.h
++++ b/src/ggml-cpu/vec.h
+@@ -58,11 +58,13 @@ extern "C" {
+ // global data
+ //
+ 
++#ifndef INFLECT_LOW_MEMORY
+ // precomputed gelu table for f16 (128 KB)
+ extern ggml_fp16_t ggml_table_gelu_f16[1 << 16];
+ 
+ // precomputed quick gelu table for f16 (128 KB)
+ extern ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
++#endif
+ 
+ //
+ // fundamental operations
+@@ -970,10 +972,16 @@ inline static float ggml_gelu_f32(float x) {
+ }
+ 
+ inline static void ggml_vec_gelu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        y[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(GGML_CPU_FP16_TO_FP32(x[i])));
++    }
++#else
+     const uint16_t * i16 = (const uint16_t *) x;
+     for (int i = 0; i < n; ++i) {
+         y[i] = ggml_table_gelu_f16[i16[i]];
+     }
++#endif
+ }
+ 
+ inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+@@ -986,6 +994,11 @@ inline static void ggml_vec_gelu_erf_f16(const int n, ggml_fp16_t * y, const ggm
+ 
+ #ifdef GGML_GELU_FP16
+ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        y[i] = ggml_gelu_f32(x[i]);
++    }
++#else
+     uint16_t t;
+     for (int i = 0; i < n; ++i) {
+         if (x[i] <= -10.0f) {
+@@ -998,6 +1011,7 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+             y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]);
+         }
+     }
++#endif
+ }
+ #else
+ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+@@ -1019,20 +1033,32 @@ inline static float ggml_gelu_quick_f32(float x) {
+ }
+ 
+ inline static void ggml_vec_gelu_quick_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        y[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(GGML_CPU_FP16_TO_FP32(x[i])));
++    }
++#else
+     const uint16_t * i16 = (const uint16_t *) x;
+     for (int i = 0; i < n; ++i) {
+         y[i] = ggml_table_gelu_quick_f16[i16[i]];
+     }
++#endif
+ }
+ 
+ #ifdef GGML_GELU_QUICK_FP16
+ inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        y[i] = ggml_gelu_quick_f32(x[i]);
++    }
++#else
+     uint16_t t;
+     for (int i = 0; i < n; ++i) {
+         ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
+         memcpy(&t, &fp16, sizeof(uint16_t));
+         y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_quick_f16[t]);
+     }
++#endif
+ }
+ #else
+ inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
+@@ -1413,6 +1439,11 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
+ 
+ #ifdef GGML_GELU_FP16
+ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        y[i] = ggml_gelu_f32(x[i]) * g[i];
++    }
++#else
+     uint16_t t;
+     for (int i = 0; i < n; ++i) {
+         if (x[i] <= -10.0f) {
+@@ -1425,6 +1456,7 @@ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, c
+             y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]) * g[i];
+         }
+     }
++#endif
+ }
+ #else
+ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
+@@ -1435,11 +1467,19 @@ inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, c
+ #endif
+ 
+ inline static void ggml_vec_geglu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        const float xi = GGML_CPU_FP16_TO_FP32(x[i]);
++        const float gi = GGML_CPU_FP16_TO_FP32(g[i]);
++        y[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_f32(xi) * gi);
++    }
++#else
+     const uint16_t * i16 = (const uint16_t *) x;
+     for (int i = 0; i < n; ++i) {
+         float v = GGML_CPU_FP16_TO_FP32(g[i]);
+         y[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[i16[i]]) * v);
+     }
++#endif
+ }
+ 
+ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g);
+@@ -1469,12 +1509,18 @@ inline static void ggml_vec_geglu_erf_f16(const int n, ggml_fp16_t * y, const gg
+ 
+ #ifdef GGML_GELU_QUICK_FP16
+ inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        y[i] = ggml_gelu_quick_f32(x[i]) * g[i];
++    }
++#else
+     uint16_t t;
+     for (int i = 0; i < n; ++i) {
+         ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
+         memcpy(&t, &fp16, sizeof(uint16_t));
+         y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_quick_f16[t]) * g[i];
+     }
++#endif
+ }
+ #else
+ inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float * x, const float * g) {
+@@ -1485,11 +1531,19 @@ inline static void ggml_vec_geglu_quick_f32(const int n, float * y, const float
+ #endif
+ 
+ inline static void ggml_vec_geglu_quick_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
++#ifdef INFLECT_LOW_MEMORY
++    for (int i = 0; i < n; ++i) {
++        const float xi = GGML_CPU_FP16_TO_FP32(x[i]);
++        const float gi = GGML_CPU_FP16_TO_FP32(g[i]);
++        y[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(xi) * gi);
++    }
++#else
+     const uint16_t * i16 = (const uint16_t *) x;
+     for (int i = 0; i < n; ++i) {
+         float v = GGML_CPU_FP16_TO_FP32(g[i]);
+         y[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(ggml_table_gelu_quick_f16[i16[i]]) * v);
+     }
++#endif
+ }
+ 
+ inline static void ggml_vec_sum_f32(const int n, float * s, const float * x) {
+diff --git a/src/ggml-impl.h b/src/ggml-impl.h
+index 62b76abb..80bf0592 100644
+--- a/src/ggml-impl.h
++++ b/src/ggml-impl.h
+@@ -1,4 +1,6 @@
+ #pragma once
++#ifndef INFLECT_GGML_IMPL_H
++#define INFLECT_GGML_IMPL_H
+ 
+ // GGML internal header
+ 
+@@ -781,3 +783,5 @@ inline bool ggml_check_edges(const struct ggml_cgraph *                cgraph,
+ GGML_API size_t gguf_type_size(enum gguf_type type);
+ GGML_API void gguf_write_to_buf(const struct gguf_context * ctx, std::vector<int8_t> & buf, bool only_meta);
+ #endif // __cplusplus
++
++#endif // INFLECT_GGML_IMPL_H

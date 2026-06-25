@@ -76,10 +76,12 @@ private:
     std::string sparse_words_;
     mutable std::ifstream flash_dict_;
     uint32_t dict_count_ = 0;
+    uint32_t sparse_stride_ = 256;
     bool flash_cmu_ = false;
     bool legacy_phone_ids_ = false;
 
     bool load_cmudict_sparse_index(std::ifstream& f, uint32_t count);
+    bool load_cmudict_sidecar_index(uint32_t count);
     std::string_view sparse_word(const SparseIndexEntry& entry) const;
     bool lookup_flash_entry(
         std::string_view word,

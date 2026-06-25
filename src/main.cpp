@@ -2,7 +2,42 @@
 #include "utils.h"
 #include <cstdlib>
 #include <cstdio>
+#include <cctype>
+#include <cstring>
 #include <string>
+
+#ifndef INFLECT_VOCODER_BACKEND
+#define INFLECT_VOCODER_BACKEND neural
+#endif
+
+#ifndef INFLECT_GRIFFIN_LIM_ITERS
+#define INFLECT_GRIFFIN_LIM_ITERS 8
+#endif
+
+#define INFLECT_MAIN_STRINGIFY_IMPL(x) #x
+#define INFLECT_MAIN_STRINGIFY(x) INFLECT_MAIN_STRINGIFY_IMPL(x)
+
+static std::string normalize_backend(std::string value) {
+    if (value.size() >= 2 &&
+        ((value.front() == '"' && value.back() == '"') ||
+         (value.front() == '\'' && value.back() == '\''))) {
+        value = value.substr(1, value.size() - 2);
+    }
+    for (char& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (c == '-') {
+            c = '_';
+        }
+    }
+    if (value == "gl" || value == "griffinlim") {
+        return "griffin_lim";
+    }
+    return value;
+}
+
+static bool is_griffin_lim_backend(const std::string& backend) {
+    return backend == "griffin_lim";
+}
 
 int main(int argc, char** argv) {
     using namespace inflect;
@@ -14,14 +49,24 @@ int main(int argc, char** argv) {
     std::string output_path   = "output.wav";
     int n_threads = -1;
     int vocoder_chunk_frames = 0;
+    int griffin_lim_iterations = INFLECT_GRIFFIN_LIM_ITERS;
+    std::string vocoder_backend =
+        normalize_backend(INFLECT_MAIN_STRINGIFY(INFLECT_VOCODER_BACKEND));
 
     if (const char* env = std::getenv("INFLECT_THREADS")) {
         int parsed = std::atoi(env);
         if (parsed > 0) n_threads = parsed;
     }
+    if (const char* env = std::getenv("INFLECT_VOCODER_BACKEND")) {
+        vocoder_backend = normalize_backend(env);
+    }
     if (const char* env = std::getenv("INFLECT_VOCODER_CHUNK_FRAMES")) {
         int parsed = std::atoi(env);
         if (parsed > 0) vocoder_chunk_frames = parsed;
+    }
+    if (const char* env = std::getenv("INFLECT_GRIFFIN_LIM_ITERS")) {
+        int parsed = std::atoi(env);
+        if (parsed >= 0) griffin_lim_iterations = parsed;
     }
 #if defined(INFLECT_LOW_MEMORY)
     if (vocoder_chunk_frames <= 0) {
@@ -31,17 +76,32 @@ int main(int argc, char** argv) {
 
     // Parse args (simplified)
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "-t" && i + 1 < argc) text = argv[++i];
-        if (std::string(argv[i]) == "-a" && i + 1 < argc) acoustic_path = argv[++i];
-        if (std::string(argv[i]) == "-v" && i + 1 < argc) vocoder_path = argv[++i];
-        if (std::string(argv[i]) == "-d" && i + 1 < argc) cmudict_path = argv[++i];
-        if (std::string(argv[i]) == "-o" && i + 1 < argc) output_path = argv[++i];
-        if ((std::string(argv[i]) == "-j" || std::string(argv[i]) == "--threads") && i + 1 < argc) {
+        const std::string arg = argv[i];
+        if (arg == "-t" && i + 1 < argc) {
+            text = argv[++i];
+        } else if (arg == "-a" && i + 1 < argc) {
+            acoustic_path = argv[++i];
+        } else if (arg == "-v" && i + 1 < argc) {
+            vocoder_path = argv[++i];
+        } else if (arg == "-d" && i + 1 < argc) {
+            cmudict_path = argv[++i];
+        } else if (arg == "-o" && i + 1 < argc) {
+            output_path = argv[++i];
+        } else if ((arg == "-j" || arg == "--threads") && i + 1 < argc) {
             n_threads = std::atoi(argv[++i]);
-        }
-        if (std::string(argv[i]) == "--vocoder-chunk-frames" && i + 1 < argc) {
+        } else if (arg == "--vocoder-chunk-frames" && i + 1 < argc) {
             vocoder_chunk_frames = std::atoi(argv[++i]);
+        } else if (arg == "--vocoder-backend" && i + 1 < argc) {
+            vocoder_backend = normalize_backend(argv[++i]);
+        } else if (arg == "--griffin-lim-iters" && i + 1 < argc) {
+            griffin_lim_iterations = std::atoi(argv[++i]);
         }
+    }
+    if (vocoder_backend != "neural" && vocoder_backend != "griffin_lim") {
+        fprintf(stderr,
+                "Unsupported vocoder backend '%s'; expected neural or griffin_lim\n",
+                vocoder_backend.c_str());
+        return 1;
     }
 
     // Init
@@ -52,9 +112,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to load acoustic model\n");
         return 1;
     }
-    if (!synth.load_vocoder(vocoder_path)) {
+    if (!is_griffin_lim_backend(vocoder_backend) && !synth.load_vocoder(vocoder_path)) {
         fprintf(stderr, "Failed to load vocoder\n");
         return 1;
+    } else if (is_griffin_lim_backend(vocoder_backend)) {
+        fprintf(stderr, "Skipping neural vocoder load; backend=griffin_lim\n");
     }
     if (!synth.load_cmudict(cmudict_path)) {
         fprintf(stderr, "Warning: cmudict not loaded, text frontend unavailable\n");
@@ -68,8 +130,11 @@ int main(int argc, char** argv) {
     params.speaker_id   = 0;
     params.seed         = 1234;
     params.vocoder_chunk_frames = vocoder_chunk_frames;
+    params.vocoder_backend = vocoder_backend;
+    params.griffin_lim_iterations = griffin_lim_iterations;
 
-    fprintf(stderr, "Synthesizing: %s\n", text.c_str());
+    fprintf(stderr, "Synthesizing backend=%s: %s\n",
+            vocoder_backend.c_str(), text.c_str());
     auto audio = synth.synthesize(text, params);
 
     fprintf(stderr, "Generated %zu samples (%.2f seconds)\n",

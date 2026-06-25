@@ -1,9 +1,12 @@
 #include "vocoder_model.h"
+#include "inflect-nano.h"
 #include "memory_trace.h"
 #include <ggml-cpu.h>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -11,10 +14,246 @@
 #include <sys/types.h>
 #include <utility>
 
+#if __has_include(<esp_dsp.h>)
+#include <esp_dsp.h>
+#define INFLECT_HAS_ESP_DSP 1
+#else
+#define INFLECT_HAS_ESP_DSP 0
+#endif
+
+#ifndef INFLECT_USE_ESP_DSP_CONTIG
+#define INFLECT_USE_ESP_DSP_CONTIG 0
+#endif
+
+#ifndef INFLECT_USE_ESP_DSP_STRIDED
+#define INFLECT_USE_ESP_DSP_STRIDED 1
+#endif
+
+#ifndef INFLECT_PROFILE_VOCODER_OPS
+#define INFLECT_PROFILE_VOCODER_OPS 0
+#endif
+
+#ifndef INFLECT_USE_RESBLOCK_IM2COL
+#define INFLECT_USE_RESBLOCK_IM2COL 1
+#endif
+
 namespace inflect {
+
+struct FloatScratch {
+    float* ptr = nullptr;
+    size_t cap = 0;
+
+    ~FloatScratch() {
+        runtime_free_scratch(ptr);
+    }
+
+    void resize(size_t n) {
+        if (n <= cap) {
+            return;
+        }
+        float* next = static_cast<float*>(
+            runtime_alloc_scratch(n * sizeof(float), ScratchMemoryKind::Psram));
+        if (next == nullptr) {
+            fprintf(stderr, "[VocoderModel] scratch allocation failed floats=%zu\n", n);
+            std::abort();
+        }
+        runtime_free_scratch(ptr);
+        ptr = next;
+        cap = n;
+    }
+
+    float* data() { return ptr; }
+    const float* data() const { return ptr; }
+};
+
+struct InternalFloatScratch {
+    float* ptr = nullptr;
+    size_t cap = 0;
+
+    ~InternalFloatScratch() {
+        runtime_free_scratch(ptr);
+    }
+
+    void resize(size_t n) {
+        if (n <= cap) {
+            return;
+        }
+        float* next = static_cast<float*>(
+            runtime_alloc_scratch(n * sizeof(float), ScratchMemoryKind::InternalPreferred));
+        if (next == nullptr) {
+            fprintf(stderr, "[VocoderModel] internal scratch allocation failed floats=%zu\n", n);
+            std::abort();
+        }
+        runtime_free_scratch(ptr);
+        ptr = next;
+        cap = n;
+    }
+
+    float* data() { return ptr; }
+};
+
+static uint32_t now_ms() { return runtime_now_ms(); }
+
+#if INFLECT_PROFILE_VOCODER_OPS
+struct VocodeOpProfile {
+    std::atomic<uint32_t> conv1d_calls{0};
+    std::atomic<uint32_t> conv_transpose_calls{0};
+    std::atomic<uint64_t> conv1d_ms{0};
+    std::atomic<uint64_t> conv_transpose_ms{0};
+    std::atomic<uint64_t> conv1d_outputs{0};
+    std::atomic<uint64_t> conv_transpose_outputs{0};
+    std::atomic<uint64_t> conv1d_macs{0};
+    std::atomic<uint64_t> conv_transpose_macs{0};
+};
+
+static VocodeOpProfile g_vocode_profile;
+
+struct VocodeOpProfileBucket {
+    const char* label;
+    std::atomic<uint32_t> calls;
+    std::atomic<uint64_t> elapsed_ms;
+    std::atomic<uint64_t> outputs;
+    std::atomic<uint64_t> macs;
+};
+
+static VocodeOpProfileBucket g_vocode_profile_buckets[] = {
+    {"conv_pre", {}, {}, {}, {}},
+    {"upsample", {}, {}, {}, {}},
+    {"resblock.convs1", {}, {}, {}, {}},
+    {"resblock.convs2", {}, {}, {}, {}},
+    {"conv_post", {}, {}, {}, {}},
+};
+
+static void vocode_profile_reset() {
+    g_vocode_profile.conv1d_calls.store(0);
+    g_vocode_profile.conv_transpose_calls.store(0);
+    g_vocode_profile.conv1d_ms.store(0);
+    g_vocode_profile.conv_transpose_ms.store(0);
+    g_vocode_profile.conv1d_outputs.store(0);
+    g_vocode_profile.conv_transpose_outputs.store(0);
+    g_vocode_profile.conv1d_macs.store(0);
+    g_vocode_profile.conv_transpose_macs.store(0);
+    for (auto& bucket : g_vocode_profile_buckets) {
+        bucket.calls.store(0);
+        bucket.elapsed_ms.store(0);
+        bucket.outputs.store(0);
+        bucket.macs.store(0);
+    }
+}
+
+static void vocode_profile_add_bucket(const char* label, uint32_t elapsed_ms, uint64_t outputs, uint64_t macs) {
+    if (label == nullptr) {
+        return;
+    }
+    for (auto& bucket : g_vocode_profile_buckets) {
+        if (std::strcmp(bucket.label, label) == 0) {
+            bucket.calls.fetch_add(1);
+            bucket.elapsed_ms.fetch_add(elapsed_ms);
+            bucket.outputs.fetch_add(outputs);
+            bucket.macs.fetch_add(macs);
+            return;
+        }
+    }
+}
+
+static void vocode_profile_add_conv1d(const char* label, uint32_t elapsed_ms, uint64_t outputs, uint64_t macs) {
+    g_vocode_profile.conv1d_calls.fetch_add(1);
+    g_vocode_profile.conv1d_ms.fetch_add(elapsed_ms);
+    g_vocode_profile.conv1d_outputs.fetch_add(outputs);
+    g_vocode_profile.conv1d_macs.fetch_add(macs);
+    vocode_profile_add_bucket(label, elapsed_ms, outputs, macs);
+}
+
+static void vocode_profile_add_conv_transpose(const char* label, uint32_t elapsed_ms, uint64_t outputs, uint64_t macs) {
+    g_vocode_profile.conv_transpose_calls.fetch_add(1);
+    g_vocode_profile.conv_transpose_ms.fetch_add(elapsed_ms);
+    g_vocode_profile.conv_transpose_outputs.fetch_add(outputs);
+    g_vocode_profile.conv_transpose_macs.fetch_add(macs);
+    vocode_profile_add_bucket(label, elapsed_ms, outputs, macs);
+}
+
+static void vocode_profile_log(uint32_t graph_compute_ms) {
+    const uint64_t conv1d_ms = g_vocode_profile.conv1d_ms.load();
+    const uint64_t conv_transpose_ms = g_vocode_profile.conv_transpose_ms.load();
+    const uint64_t custom_ms = conv1d_ms + conv_transpose_ms;
+    const int64_t other_ms = (int64_t)graph_compute_ms - (int64_t)custom_ms;
+    fprintf(stderr,
+            "[VocoderProfile] graph_ms=%u custom_ms=%llu other_ms=%lld "
+            "conv1d_calls=%u conv1d_ms=%llu conv1d_outputs=%llu conv1d_macs=%llu "
+            "convT_calls=%u convT_ms=%llu convT_outputs=%llu convT_macs=%llu\n",
+            (unsigned)graph_compute_ms,
+            (unsigned long long)custom_ms,
+            (long long)other_ms,
+            (unsigned)g_vocode_profile.conv1d_calls.load(),
+            (unsigned long long)conv1d_ms,
+            (unsigned long long)g_vocode_profile.conv1d_outputs.load(),
+            (unsigned long long)g_vocode_profile.conv1d_macs.load(),
+            (unsigned)g_vocode_profile.conv_transpose_calls.load(),
+            (unsigned long long)conv_transpose_ms,
+            (unsigned long long)g_vocode_profile.conv_transpose_outputs.load(),
+            (unsigned long long)g_vocode_profile.conv_transpose_macs.load());
+    for (const auto& bucket : g_vocode_profile_buckets) {
+        const uint32_t calls = bucket.calls.load();
+        if (calls == 0) {
+            continue;
+        }
+        const uint64_t elapsed_ms = bucket.elapsed_ms.load();
+        const uint64_t outputs = bucket.outputs.load();
+        const uint64_t macs = bucket.macs.load();
+        fprintf(stderr,
+                "[VocoderProfile] op=%s calls=%u ms=%llu outputs=%llu macs=%llu us_per_output=%llu ns_per_mac=%llu\n",
+                bucket.label,
+                (unsigned)calls,
+                (unsigned long long)elapsed_ms,
+                (unsigned long long)outputs,
+                (unsigned long long)macs,
+                outputs > 0 ? (unsigned long long)((elapsed_ms * 1000ULL) / outputs) : 0ULL,
+                macs > 0 ? (unsigned long long)((elapsed_ms * 1000000ULL) / macs) : 0ULL);
+    }
+}
+#else
+static void vocode_profile_reset() {}
+static void vocode_profile_add_conv1d(const char*, uint32_t, uint64_t, uint64_t) {}
+static void vocode_profile_add_conv_transpose(const char*, uint32_t, uint64_t, uint64_t) {}
+static void vocode_profile_log(uint32_t) {}
+#endif
 
 static ggml_tensor* channel_param_3d(ggml_context* gctx, ggml_tensor* t) {
     return ggml_reshape_3d(gctx, t, 1, t->ne[0], 1);
+}
+
+static float dot_f32_strided(const float* a, int step_a, const float* b, int step_b, int n) {
+    float out = 0.0f;
+    if (n <= 0) {
+        return 0.0f;
+    }
+#if INFLECT_HAS_ESP_DSP && INFLECT_USE_ESP_DSP_CONTIG
+    if (step_a == 1 && step_b == 1) {
+        if (dsps_dotprod_f32(a, b, &out, n) == ESP_OK) {
+            return out;
+        }
+    }
+#endif
+#if INFLECT_HAS_ESP_DSP && INFLECT_USE_ESP_DSP_STRIDED
+    if (step_a > 0 && step_b > 0) {
+        out = 0.0f;
+        if (dsps_dotprode_f32(a, b, &out, n, step_a, step_b) == ESP_OK) {
+            return out;
+        }
+    }
+    out = 0.0f;
+#endif
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        out += a[i * step_a] * b[i * step_b] +
+               a[(i + 1) * step_a] * b[(i + 1) * step_b] +
+               a[(i + 2) * step_a] * b[(i + 2) * step_b] +
+               a[(i + 3) * step_a] * b[(i + 3) * step_b];
+    }
+    for (; i < n; i++) {
+        out += a[i * step_a] * b[i * step_b];
+    }
+    return out;
 }
 
 static float tensor_get_f32(const ggml_tensor* t, int64_t i0, int64_t i1 = 0, int64_t i2 = 0) {
@@ -64,15 +303,88 @@ static void tensor_set_f32(ggml_tensor* t, float v, int64_t i0, int64_t i1, int6
     *(float*)((char*)t->data + i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2]) = v;
 }
 
+static bool is_resblock_conv_label(const char* label) {
+    return label != nullptr &&
+           (std::strcmp(label, "resblock.convs1") == 0 ||
+            std::strcmp(label, "resblock.convs2") == 0);
+}
+
+static void quant_conv1d_resblock_im2col_op(
+    ggml_tensor* dst,
+    int ith,
+    int nth,
+    const VocoderQuantConv1dOpData* p,
+    const ggml_tensor* x,
+    const ggml_tensor* weight,
+    const ggml_tensor* bias,
+    const ggml_type_traits* traits
+) {
+    const int64_t T = dst->ne[0];
+    const int64_t out_ch = dst->ne[1];
+    const int64_t batch = dst->ne[2];
+    const int64_t in_ch = x->ne[1];
+    const int64_t flat = (int64_t)p->kernel_size * in_ch;
+
+    FloatScratch weight_rows;
+    InternalFloatScratch input_window;
+    FloatScratch bias_values;
+    weight_rows.resize((size_t)weight->ne[0] * (size_t)out_ch);
+    input_window.resize((size_t)flat);
+    if (bias != nullptr) {
+        bias_values.resize((size_t)out_ch);
+    }
+
+    float* weights_f = weight_rows.data();
+    for (int64_t o = 0; o < out_ch; o++) {
+        const char* row_ptr = static_cast<const char*>(weight->data) + o * weight->nb[1];
+        traits->to_float(row_ptr, weights_f + o * weight->ne[0], weight->ne[0]);
+        if (bias != nullptr) {
+            bias_values.data()[o] = tensor_get_f32(bias, o, 0, 0);
+        }
+    }
+
+    const char* x_data = static_cast<const char*>(x->data);
+    char* dst_data = static_cast<char*>(dst->data);
+    const int64_t t_start = (T * ith) / nth;
+    const int64_t t_end = (T * (ith + 1)) / nth;
+
+    for (int64_t b = 0; b < batch; b++) {
+        for (int64_t t = t_start; t < t_end; t++) {
+            float* window = input_window.data();
+            for (int64_t c = 0; c < in_ch; c++) {
+                float* dst_c = window + c * p->kernel_size;
+                for (int64_t k = 0; k < p->kernel_size; k++) {
+                    const int64_t src_t = t * p->stride + k * p->dilation - p->padding;
+                    if (src_t < 0 || src_t >= x->ne[0]) {
+                        dst_c[k] = 0.0f;
+                    } else {
+                        const char* src = x_data + src_t * x->nb[0] + c * x->nb[1] + b * x->nb[2];
+                        dst_c[k] = *reinterpret_cast<const float*>(src);
+                    }
+                }
+            }
+
+            for (int64_t o = 0; o < out_ch; o++) {
+                const float* w_row = weights_f + o * weight->ne[0];
+                const float v = (bias != nullptr ? bias_values.data()[o] : 0.0f) +
+                                dot_f32_strided(window, 1, w_row, 1, (int)flat);
+                *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
+            }
+        }
+    }
+}
+
 static void quant_conv1d_op(
     ggml_tensor* dst,
     int ith,
     int nth,
     void* userdata
 ) {
+    const uint32_t op_start_ms = now_ms();
     const auto* p = static_cast<const VocoderQuantConv1dOpData*>(userdata);
     const ggml_tensor* x = dst->src[0];      // [T, in_ch, B]
     const ggml_tensor* weight = dst->src[1]; // [K*in_ch padded, out_ch]
+    const ggml_tensor* bias = dst->src[2];
     if (x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_quantized(weight->type)) {
         fprintf(stderr, "[VocoderModel] unsupported low-memory conv1d tensor types\n");
         std::abort();
@@ -90,7 +402,19 @@ static void quant_conv1d_op(
         std::abort();
     }
 
-    thread_local std::vector<float> weight_row;
+#if INFLECT_USE_RESBLOCK_IM2COL
+    if (p->stride == 1 && is_resblock_conv_label(p->profile_label)) {
+        quant_conv1d_resblock_im2col_op(dst, ith, nth, p, x, weight, bias, traits);
+        const uint64_t t_start = (uint64_t)((T * ith) / nth);
+        const uint64_t t_end = (uint64_t)((T * (ith + 1)) / nth);
+        const uint64_t outputs = (t_end - t_start) * (uint64_t)out_ch * (uint64_t)batch;
+        const uint64_t macs = outputs * (uint64_t)p->kernel_size * (uint64_t)in_ch;
+        vocode_profile_add_conv1d(p->profile_label, now_ms() - op_start_ms, outputs, macs);
+        return;
+    }
+#endif
+
+    thread_local FloatScratch weight_row;
     weight_row.resize(weight->ne[0]);
 
     const char* x_data = static_cast<const char*>(x->data);
@@ -101,26 +425,29 @@ static void quant_conv1d_op(
     for (int64_t o = o_start; o < o_end; o++) {
         const char* row_ptr = static_cast<const char*>(weight->data) + o * weight->nb[1];
         traits->to_float(row_ptr, weight_row.data(), weight->ne[0]);
+        const float bias_v = bias != nullptr ? tensor_get_f32(bias, o, 0, 0) : 0.0f;
 
         for (int64_t b = 0; b < batch; b++) {
             for (int64_t t = 0; t < T; t++) {
-                float v = 0.0f;
+                float v = bias_v;
                 for (int64_t k = 0; k < p->kernel_size; k++) {
                     const int64_t src_t = t * p->stride + k * p->dilation - p->padding;
                     if (src_t < 0 || src_t >= x->ne[0]) {
                         continue;
                     }
-                    for (int64_t i = 0; i < in_ch; i++) {
-                        const int64_t flat = i * p->kernel_size + k;
-                        const float xv = *reinterpret_cast<const float*>(
-                            x_data + src_t * x->nb[0] + i * x->nb[1] + b * x->nb[2]);
-                        v += xv * weight_row[flat];
-                    }
+                    const char* x_row = x_data + src_t * x->nb[0] + b * x->nb[2];
+                    const auto* x_f = reinterpret_cast<const float*>(x_row);
+                    v += dot_f32_strided(x_f, (int)(x->nb[1] / sizeof(float)),
+                                         weight_row.data() + k, p->kernel_size,
+                                         (int)in_ch);
                 }
                 *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
             }
         }
     }
+    const uint64_t outputs = (uint64_t)(o_end - o_start) * (uint64_t)T * (uint64_t)batch;
+    const uint64_t macs = outputs * (uint64_t)p->kernel_size * (uint64_t)in_ch;
+    vocode_profile_add_conv1d(p->profile_label, now_ms() - op_start_ms, outputs, macs);
 }
 
 static ggml_tensor* add_channel_bias(ggml_context* gctx, ggml_tensor* x, ggml_tensor* bias) {
@@ -204,6 +531,14 @@ static void mem_trace_top_graph_tensors(const char* label, ggml_cgraph* graph, i
     }
 }
 
+static bool reserve_and_alloc_graph(ggml_gallocr_t allocr, ggml_cgraph* graph) {
+    if (!ggml_gallocr_reserve(allocr, graph) || !ggml_gallocr_alloc_graph(allocr, graph)) {
+        fprintf(stderr, "[VocoderModel] Failed to allocate vocoder graph\n");
+        return false;
+    }
+    return true;
+}
+
 static void debug_manifest(const std::string& dir, const std::string& line) {
     if (dir.empty()) return;
     std::ofstream f(debug_path(dir, "manifest.txt"), std::ios::app);
@@ -231,19 +566,25 @@ static std::vector<float> debug_transpose_time_channel(const std::vector<float>&
 static ggml_tensor* conv1d_vocoder(
     ggml_context* gctx,
     ggml_tensor* weight,
+    ggml_tensor* bias,
     ggml_tensor* x,
     int kernel_size,
     int stride,
     int padding,
     int dilation,
-    std::vector<VocoderQuantConv1dOpData>& op_data
+    std::vector<VocoderQuantConv1dOpData>& op_data,
+    const char* profile_label
 ) {
     if (!ggml_is_quantized(weight->type)) {
         ggml_tensor* kernel = weight;
         if (kernel->type != GGML_TYPE_F16) {
             kernel = ggml_cast(gctx, kernel, GGML_TYPE_F16);
         }
-        return ggml_conv_1d(gctx, kernel, x, stride, padding, dilation);
+        ggml_tensor* y = ggml_conv_1d(gctx, kernel, x, stride, padding, dilation);
+        if (bias != nullptr) {
+            y = add_channel_bias(gctx, y, bias);
+        }
+        return y;
     }
 
     const int64_t in_ch = x->ne[1];
@@ -257,10 +598,11 @@ static ggml_tensor* conv1d_vocoder(
 
 #if defined(INFLECT_LOW_MEMORY)
     const int64_t out_t = (x->ne[0] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
-    op_data.push_back({kernel_size, stride, padding, dilation});
-    ggml_tensor* args[] = {x, weight};
+    op_data.push_back({profile_label, kernel_size, stride, padding, dilation});
+    ggml_tensor* args[] = {x, weight, bias};
     return ggml_custom_4d(gctx, GGML_TYPE_F32, out_t, out_ch, x->ne[2], 1,
-                          args, 2, quant_conv1d_op, GGML_N_TASKS_MAX, &op_data.back());
+                          args, bias != nullptr ? 3 : 2,
+                          quant_conv1d_op, GGML_N_TASKS_MAX, &op_data.back());
 #else
     // ggml_im2col only needs this tensor for shape/type; weights are consumed
     // by the padded quantized matrix multiply below. Use F32 columns because
@@ -283,6 +625,7 @@ static void quant_conv_transpose1d_op(
     int nth,
     void* userdata
 ) {
+    const uint32_t op_start_ms = now_ms();
     const auto* p = static_cast<const QuantConvTranspose1dOpData*>(userdata);
     const ggml_tensor* x = dst->src[0];      // [T_in, in_ch, B]
     const ggml_tensor* weight = dst->src[1]; // [K*in_ch padded, out_ch]
@@ -304,7 +647,7 @@ static void quant_conv_transpose1d_op(
         std::abort();
     }
 
-    thread_local std::vector<float> weight_row;
+    thread_local FloatScratch weight_row;
     weight_row.resize(weight->ne[0]);
 
     const char* x_data = static_cast<const char*>(x->data);
@@ -318,27 +661,30 @@ static void quant_conv_transpose1d_op(
 
         for (int64_t b = 0; b < batch; b++) {
             for (int64_t t = 0; t < out_t; t++) {
+                const int64_t full_t = t + p->crop_left;
                 float v = 0.0f;
-                for (int64_t k = 0; k < p->kernel_size; k++) {
-                    const int64_t rem = t - k;
-                    if (rem < 0 || rem % p->stride != 0) {
-                        continue;
+                for (int64_t k = full_t % p->stride; k < p->kernel_size; k += p->stride) {
+                    if (k > full_t) {
+                        break;
                     }
-                    const int64_t src_t = rem / p->stride;
+                    const int64_t src_t = (full_t - k) / p->stride;
                     if (src_t < 0 || src_t >= in_t) {
                         continue;
                     }
-                    for (int64_t i = 0; i < in_ch; i++) {
-                        const int64_t flat = k * in_ch + i;
-                        const float xv = *reinterpret_cast<const float*>(
-                            x_data + src_t * x->nb[0] + i * x->nb[1] + b * x->nb[2]);
-                        v += xv * weight_row[flat];
-                    }
+                    const char* x_row = x_data + src_t * x->nb[0] + b * x->nb[2];
+                    const auto* x_f = reinterpret_cast<const float*>(x_row);
+                    v += dot_f32_strided(x_f, (int)(x->nb[1] / sizeof(float)),
+                                         weight_row.data() + k * in_ch, 1,
+                                         (int)in_ch);
                 }
                 *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
             }
         }
     }
+    const uint64_t outputs = (uint64_t)(o_end - o_start) * (uint64_t)out_t * (uint64_t)batch;
+    const uint64_t taps_per_output = (uint64_t)((p->kernel_size + p->stride - 1) / p->stride);
+    const uint64_t macs = outputs * taps_per_output * (uint64_t)in_ch;
+    vocode_profile_add_conv_transpose(p->profile_label, now_ms() - op_start_ms, outputs, macs);
 }
 
 static ggml_tensor* quant_or_f16_conv_transpose_1d(
@@ -347,14 +693,17 @@ static ggml_tensor* quant_or_f16_conv_transpose_1d(
     ggml_tensor* x,
     int kernel_size,
     int stride,
-    std::vector<QuantConvTranspose1dOpData>& op_data
+    int crop,
+    std::vector<QuantConvTranspose1dOpData>& op_data,
+    const char* profile_label
 ) {
     if (!ggml_is_quantized(weight->type)) {
         ggml_tensor* kernel = weight;
         if (kernel->type != GGML_TYPE_F16) {
             kernel = ggml_cast(ctx, kernel, GGML_TYPE_F16);
         }
-        return ggml_conv_transpose_1d(ctx, kernel, x, stride, 0, 1);
+        ggml_tensor* y = ggml_conv_transpose_1d(ctx, kernel, x, stride, 0, 1);
+        return crop_time_3d(ctx, y, crop, crop);
     }
 
     const int64_t in_ch = x->ne[1];
@@ -366,8 +715,12 @@ static ggml_tensor* quant_or_f16_conv_transpose_1d(
         std::abort();
     }
 
-    const int64_t out_t = (x->ne[0] - 1) * stride + kernel_size;
-    op_data.push_back({kernel_size, stride});
+    const int64_t out_t = (x->ne[0] - 1) * stride + kernel_size - 2 * crop;
+    if (out_t <= 0) {
+        fprintf(stderr, "[VocoderModel] invalid cropped upsample length\n");
+        std::abort();
+    }
+    op_data.push_back({profile_label, kernel_size, stride, crop});
     ggml_tensor* args[] = {x, weight};
     return ggml_custom_4d(ctx, GGML_TYPE_F32, out_t, out_ch, x->ne[2], 1,
                           args, 2, quant_conv_transpose1d_op, GGML_N_TASKS_MAX, &op_data.back());
@@ -467,7 +820,6 @@ void VocoderModel::fold_weight_norm(
 bool VocoderModel::load(ModelLoader& loader) {
     const int n_ups = config_.upsample_rates.size();
     const int n_res = config_.resblock_kernel_sizes.size();
-    const int init_ch = config_.upsample_initial_channel;
     bool ok = true;
 
     auto get = [&](const std::string& name) -> ggml_tensor* {
@@ -588,13 +940,15 @@ ggml_tensor* VocoderModel::build_resblock(
     ggml_context* gctx,
     ggml_tensor* x,   // [T, ch, 1] — GGML conv1d input layout
     const ResBlockWeights& w,
-    int kernel_size
+    int kernel_size,
+    int max_depth
 ) {
     // ResBlock1:
     //   for each (c1, c2, a1, a2) in zip(convs1, convs2, acts1, acts2):
     //     y = a1(x) → c1(y) → a2(y) → c2(y) → x = x + y
 
-    for (int i = 0; i < 3; i++) {
+    const int depth = std::max(1, std::min(3, max_depth));
+    for (int i = 0; i < depth; i++) {
         int K = kernel_size;
         int dilation = config_.resblock_dilation_sizes[i % config_.resblock_dilation_sizes.size()][i];
         int pad1 = (K * dilation - dilation) / 2;
@@ -603,16 +957,17 @@ ggml_tensor* VocoderModel::build_resblock(
         // a1(x)
         ggml_tensor* y = snake(gctx, x, w.acts1_alpha[i]);
         // c1(y) — dilated conv
-        y = conv1d_vocoder(gctx, w.convs1_w[i], y, K, 1, pad1, dilation, quant_conv1d_ops_);
-        y = add_channel_bias(gctx, y, w.convs1_b[i]);
+        y = conv1d_vocoder(gctx, w.convs1_w[i], w.convs1_b[i],
+                           y, K, 1, pad1, dilation,
+                           quant_conv1d_ops_, "resblock.convs1");
 
         // a2(y)
         y = snake(gctx, y, w.acts2_alpha[i]);
         // c2(y) — dilation=1 conv
-        y = conv1d_vocoder(gctx, w.convs2_w[i], y, K, 1, pad2, 1, quant_conv1d_ops_);
-        y = add_channel_bias(gctx, y, w.convs2_b[i]);
+        y = conv1d_vocoder(gctx, w.convs2_w[i], w.convs2_b[i],
+                           y, K, 1, pad2, 1,
+                           quant_conv1d_ops_, "resblock.convs2");
 
-        // Residual
         x = ggml_add(gctx, x, y);
     }
     return x;
@@ -626,11 +981,21 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     ggml_context* gctx,
     ggml_tensor* mel  // [n_mels, n_frames, 1]
 ) {
-    const int n_mels = config_.num_mels;
     const int n_ups = config_.upsample_rates.size();
     const int n_res = config_.resblock_kernel_sizes.size();
+    const int active_res = std::min(n_res, 3);
+    const int active_depth = 3;
     const int init_ch = config_.upsample_initial_channel;
     (void)init_ch;
+
+    fprintf(stderr,
+            "[VocoderModel] resblocks=%d/%d depth=%d/3 residual_convs=%d/%d im2col=%d\n",
+            active_res,
+            n_res,
+            active_depth,
+            n_ups * active_res * active_depth * 2,
+            n_ups * n_res * 3 * 2,
+            INFLECT_USE_RESBLOCK_IM2COL);
 
     const bool capture_debug = !debug_dump_dir().empty();
     std::vector<ggml_tensor*> debug_outputs;
@@ -648,8 +1013,9 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     ggml_tensor* x = ggml_permute(gctx, mel, 1, 0, 2, 3); // [n_frames, n_mels, 1]
     x = ggml_cont(gctx, x);
 
-    x = conv1d_vocoder(gctx, weights_.conv_pre_w, x, 7, 1, 3, 1, quant_conv1d_ops_);
-    x = add_channel_bias(gctx, x, weights_.conv_pre_b);
+    x = conv1d_vocoder(gctx, weights_.conv_pre_w, weights_.conv_pre_b,
+                       x, 7, 1, 3, 1,
+                       quant_conv1d_ops_, "conv_pre");
     capture("vocoder_conv_pre", x);
 
     // ── Upsampling + ResBlocks ──────────────────────────────────────
@@ -664,16 +1030,16 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
         // Transposed conv: upsampling
         // ggml_conv_transpose_1d(ctx, kernel, input, stride, padding, dilation)
         // This GGML revision only supports p0=0 and d0=1 for conv_transpose_1d.
-        x = quant_or_f16_conv_transpose_1d(gctx, weights_.ups_w[i], x, K, rate, quant_conv_transpose_ops_);
-        x = crop_time_3d(gctx, x, pad, pad);
+        x = quant_or_f16_conv_transpose_1d(gctx, weights_.ups_w[i], x, K, rate, pad,
+                                           quant_conv_transpose_ops_, "upsample");
         capture("vocoder_upsample_" + std::to_string(i), x);
 
         // Residual blocks (sum and average)
         ggml_tensor* xs = nullptr;
-        for (int j = 0; j < n_res; j++) {
+        for (int j = 0; j < active_res; j++) {
             int rb_idx = i * n_res + j;
             int rb_kernel = config_.resblock_kernel_sizes[j];
-            ggml_tensor* rb_out = build_resblock(gctx, x, weights_.resblocks[rb_idx], rb_kernel);
+            ggml_tensor* rb_out = build_resblock(gctx, x, weights_.resblocks[rb_idx], rb_kernel, active_depth);
             capture("vocoder_resblock_" + std::to_string(i) + "_" + std::to_string(j), rb_out);
             if (j == 0) {
                 xs = rb_out;
@@ -681,14 +1047,15 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
                 xs = ggml_add(gctx, xs, rb_out);
             }
         }
-        x = ggml_scale(gctx, xs, 1.0f / n_res);
+        x = ggml_scale(gctx, xs, 1.0f / active_res);
         capture("vocoder_resblock_avg_" + std::to_string(i), x);
     }
 
     // ── Post ────────────────────────────────────────────────────────
     x = snake(gctx, x, weights_.post_act_alpha);
-    x = conv1d_vocoder(gctx, weights_.conv_post_w, x, 7, 1, 3, 1, quant_conv1d_ops_);
-    x = add_channel_bias(gctx, x, weights_.conv_post_b);
+    x = conv1d_vocoder(gctx, weights_.conv_post_w, weights_.conv_post_b,
+                       x, 7, 1, 3, 1,
+                       quant_conv1d_ops_, "conv_post");
     capture("vocoder_conv_post", x);
     x = ggml_tanh(gctx, x);
     capture("vocoder_tanh", x);
@@ -715,6 +1082,11 @@ std::vector<float> VocoderModel::vocode(
     int n_frames,
     ggml_backend_t backend
 ) {
+    const uint32_t start_ms = now_ms();
+    uint32_t stage_ms = start_ms;
+    fprintf(stderr, "[VocoderModel] vocode begin frames=%d mels=%d samples_est=%d\n",
+            n_frames, n_mels, n_frames * total_upsample());
+
     // Create graph context
     size_t gctx_size = 1024 * 1024;
     struct ggml_init_params gparams = {
@@ -724,6 +1096,7 @@ std::vector<float> VocoderModel::vocode(
     };
     ggml_context* gctx = ggml_init(gparams);
     mem_trace_rss("vocoder ctx init");
+    mem_trace_heap("vocoder ctx init");
 
     // Create input tensor
     ggml_tensor* mel_t = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, n_mels, n_frames, 1);
@@ -739,24 +1112,51 @@ std::vector<float> VocoderModel::vocode(
     quant_conv_transpose_ops_.reserve(config_.upsample_rates.size());
     ggml_cgraph* graph = build_vocoder_graph(gctx, mel_t);
     mem_trace_rss("vocoder graph built");
+    mem_trace_heap("vocoder graph built");
+    fprintf(stderr, "[VocoderModel] graph built stage_ms=%u total_ms=%u\n",
+            (unsigned)(now_ms() - stage_ms),
+            (unsigned)(now_ms() - start_ms));
+    stage_ms = now_ms();
 
     // Allocate
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    ggml_gallocr_alloc_graph(allocr, graph);
+    if (!reserve_and_alloc_graph(allocr, graph)) {
+        ggml_gallocr_free(allocr);
+        ggml_free(gctx);
+        return {};
+    }
     mem_trace_graph("vocoder", gctx, allocr);
     mem_trace_top_graph_tensors("vocoder", graph);
     mem_trace_rss("vocoder allocated");
+    mem_trace_heap("vocoder allocated");
+    fprintf(stderr, "[VocoderModel] allocated stage_ms=%u total_ms=%u\n",
+            (unsigned)(now_ms() - stage_ms),
+            (unsigned)(now_ms() - start_ms));
+    stage_ms = now_ms();
 
     // Set input
     ggml_backend_tensor_set(mel_t, mel.data(), 0, n_mels * n_frames * sizeof(float));
     mem_trace_rss("vocoder input copied");
+    mem_trace_heap("vocoder input copied");
+    fprintf(stderr, "[VocoderModel] input copied stage_ms=%u total_ms=%u\n",
+            (unsigned)(now_ms() - stage_ms),
+            (unsigned)(now_ms() - start_ms));
+    stage_ms = now_ms();
 
     // Compute
+    vocode_profile_reset();
     ggml_status status = ggml_backend_graph_compute(backend, graph);
+    const uint32_t compute_elapsed_ms = now_ms() - stage_ms;
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[VocoderModel] Graph computation failed\n");
     }
     mem_trace_rss("vocoder computed");
+    mem_trace_heap("vocoder computed");
+    fprintf(stderr, "[VocoderModel] computed stage_ms=%u total_ms=%u\n",
+            (unsigned)compute_elapsed_ms,
+            (unsigned)(now_ms() - start_ms));
+    vocode_profile_log(compute_elapsed_ms);
+    stage_ms = now_ms();
 
     const std::string dump_dir = debug_dump_dir();
     if (!dump_dir.empty()) {
@@ -801,14 +1201,25 @@ std::vector<float> VocoderModel::vocode(
     std::vector<float> audio(ggml_nelements(audio_t));
     ggml_backend_tensor_get(audio_t, audio.data(), 0, ggml_nbytes(audio_t));
     mem_trace_rss("vocoder audio copied");
+    mem_trace_heap("vocoder audio copied");
+    fprintf(stderr, "[VocoderModel] audio copied samples=%zu stage_ms=%u total_ms=%u\n",
+            audio.size(),
+            (unsigned)(now_ms() - stage_ms),
+            (unsigned)(now_ms() - start_ms));
+    stage_ms = now_ms();
 
     // Cleanup
     ggml_gallocr_free(allocr);
     mem_release_to_os();
     mem_trace_rss("vocoder allocator freed");
+    mem_trace_heap("vocoder allocator freed");
     ggml_free(gctx);
     mem_release_to_os();
     mem_trace_rss("vocoder context freed");
+    mem_trace_heap("vocoder context freed");
+    fprintf(stderr, "[VocoderModel] vocode complete stage_ms=%u total_ms=%u\n",
+            (unsigned)(now_ms() - stage_ms),
+            (unsigned)(now_ms() - start_ms));
 
     return audio;
 }
@@ -825,6 +1236,25 @@ void VocoderModel::vocode_streaming(
     ggml_backend_t backend,
     AudioCallback callback
 ) {
+    constexpr int kLowMemoryMaxChunkFrames = 96;
+    constexpr int kLowMemoryMinChunkFrames = 24;
+
+#if defined(INFLECT_LOW_MEMORY)
+    if (chunk_frames <= 0) {
+        chunk_frames = kLowMemoryMaxChunkFrames;
+    }
+    if (chunk_frames > kLowMemoryMaxChunkFrames) {
+        chunk_frames = kLowMemoryMaxChunkFrames;
+    }
+    if (n_frames > kLowMemoryMaxChunkFrames) {
+        chunk_frames = kLowMemoryMaxChunkFrames;
+    } else if (chunk_frames > 0 && chunk_frames < kLowMemoryMinChunkFrames) {
+        chunk_frames = kLowMemoryMinChunkFrames;
+    }
+    fprintf(stderr, "[VocoderModel] low-memory chunk policy frames=%d chunk_frames=%d\n",
+            n_frames, chunk_frames);
+#endif
+
     if (chunk_frames <= 0 || chunk_frames >= n_frames) {
         // No chunking — vocode everything at once
         auto audio = vocode(mel, n_mels, n_frames, backend);
@@ -846,7 +1276,7 @@ void VocoderModel::vocode_streaming(
 
     int overlap = 64; // Conservative overlap for this vocoder
 #if defined(INFLECT_LOW_MEMORY)
-    overlap = 8;
+    overlap = 4;
 #endif
     if (chunk_frames <= overlap) {
         auto audio = vocode(mel, n_mels, n_frames, backend);
@@ -861,9 +1291,13 @@ void VocoderModel::vocode_streaming(
     std::vector<float> pending_tail;
     std::vector<float> blended;
 
+    int chunk_index = 0;
     for (int start = 0; start < n_frames; start += hop) {
+        const uint32_t chunk_start_ms = now_ms();
         int end = std::min(start + chunk_frames, n_frames);
         int chunk_len = end - start;
+        fprintf(stderr, "[VocoderModel] chunk %d begin mel_start=%d frames=%d\n",
+                chunk_index, start, chunk_len);
 
         // Extract mel chunk
         mel_chunk.resize(n_mels * chunk_len);
@@ -907,6 +1341,10 @@ void VocoderModel::vocode_streaming(
         } else {
             pending_tail.clear();
         }
+        fprintf(stderr, "[VocoderModel] chunk %d done elapsed_ms=%u\n",
+                chunk_index,
+                (unsigned)(now_ms() - chunk_start_ms));
+        chunk_index++;
         if (end >= n_frames) {
             break;
         }
