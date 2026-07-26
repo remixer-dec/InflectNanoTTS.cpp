@@ -1,16 +1,22 @@
 # InflectNanoTTS.cpp
 
-Small C++/GGML port of the [Inflect-Nano TTS](https://huggingface.co/owensong/Inflect-Nano-v1) pipeline.
+Small C++/GGML port of the
+[Inflect-Nano TTS v1](https://huggingface.co/owensong/Inflect-Nano-v1),
+[Inflect-Nano TTS v2](https://huggingface.co/owensong/Inflect-Nano-v2/), and
+[Inflect-Micro TTS v2](https://huggingface.co/owensong/Inflect-Micro-v2/)
+pipelines.
 
-This repo contains the runtime, conversion helpers, and parity/debug tooling. Currently only cpu inference is supported. 
+This repo contains the runtime, conversion helpers, and parity/debug tooling. Currently only CPU inference is supported.
 Pre-quantized weights are available [here](https://huggingface.co/remixerdec/Inflect-Nano-v1-GGUF).
 
 ## Layout
 
 - `src/`: runtime and CLI
 - `tools/`: fallback build and parity helpers, conversion scripts
-- `convert.py`: PyTorch checkpoint to GGUF conversion
-- `compile_cmudict.py`: compile `cmudict.rep` into `cmudict.bin`
+- `tools/convert.py`: v1 PyTorch checkpoint to GGUF conversion
+- `tools/convert_v2.py`: v2 checkpoint conversion and GGUF quantization
+- `tools/compile_cmudict.py`: compile `cmudict.rep` into `cmudict.bin`
+- `tools/compile-v2-lexicon.py`: compile the v2 eSpeak lexicon into `lexicon.bin`
 - `ggml/`: vendored GGML submodule
 
 ## Build
@@ -71,6 +77,36 @@ The CLI expects explicit asset paths:
   -o output.wav
 ```
 
+## Inflect Nano v2
+
+V2 uses one unified `inflect-v2` GGUF plus a flash-backed `IVL2` lexicon.
+
+Nano-v2 and Micro-v2 use the same GGUF architecture identifier. Active channel
+dimensions are read from GGUF metadata; the converter reads them from each
+release's `config.json`. Runtime inference never reads a PyTorch checkpoint or
+configuration JSON.
+
+```bash
+./build/<os>-<arch>/inflect-nano \
+  --model-family v2 \
+  --v2-model /path/to/inflect_nano_v2_f32.gguf \
+  --v2-lexicon /path/to/lexicon.bin \
+  --speed 1.0 \
+  --variation 0.667 \
+  --seed 7 \
+  --decoder-chunk-frames 32 \
+  -t "A small voice can still have something meaningful to say." \
+  -o output.wav
+```
+
+`--variation` controls latent sampling noise: `0` disables it and `1` uses the
+full learned variance. `--seed` makes synthesis deterministic.
+
+`--token-file tokens.txt` bypasses text processing with a whitespace- or
+comma-separated list of unblanked token IDs. The runtime inserts blank token
+`0` between them, which is useful for testing exact pronunciations or frontend
+output.
+
 ### Griffin-Lim backend
 
 The neural vocoder is the default quality path. For lower memory and faster experiments, add:
@@ -80,3 +116,8 @@ The neural vocoder is the default quality path. For lower memory and faster expe
 ```
 
 This synthesizes waveform audio from the acoustic mel output with Griffin-Lim and gives a robotic vibe to it. The vocoder model is not loaded, so `-v` is not used. You can also set `INFLECT_VOCODER_BACKEND=griffin_lim`.
+
+Griffin-Lim applies only to v1. V1 exposes an 80-bin mel magnitude estimate
+before vocoding; v2 is a VITS model whose expanded latent is consumed directly
+by its learned waveform decoder. The v2 latent is not a mel or STFT magnitude,
+so passing it to Griffin-Lim would not be a valid alternate decoder.

@@ -202,6 +202,10 @@ std::string ModelLoader::get_string(const std::string& key, const std::string& d
     return s ? std::string(s) : default_val;
 }
 
+bool ModelLoader::has_key(const std::string& key) const {
+    return gguf_ && gguf_find_key(gguf_, key.c_str()) >= 0;
+}
+
 std::vector<std::string> ModelLoader::tensor_names() const {
     std::vector<std::string> names;
     const int n_tensors = gguf_ ? gguf_get_n_tensors(gguf_) : 0;

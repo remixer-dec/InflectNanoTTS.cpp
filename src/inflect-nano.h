@@ -4,6 +4,7 @@
 #include <ggml-backend.h>
 #include <ggml-alloc.h>
 #include "model_config.h"
+#include "v2_frontend.h"
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -43,6 +44,7 @@ class AcousticModel;
 class VocoderModel;
 class TextFrontend;
 class ModelLoader;
+class V2Model;
 
 class Synthesizer {
 public:
@@ -56,6 +58,7 @@ public:
     bool load_acoustic(const std::string& gguf_path);
     bool load_vocoder(const std::string& gguf_path);
     bool load_cmudict(const std::string& bin_path);
+    bool load_v2(const std::string& model_gguf, const std::string& lexicon_bin);
 
     // Full synthesis: text → audio
     std::vector<float> synthesize(
@@ -74,6 +77,33 @@ public:
     // Text → tokens (exposed for debugging / golden reference tests)
     TokenSequence text_to_tokens(const std::string& text);
 
+    // Inflect v2 APIs. V1 state and behavior are independent.
+    V2FrontendResult v2_text_to_tokens(const std::string& text);
+    std::vector<float> synthesize_v2(
+        const std::string& text,
+        const V2SynthParams& params = {}
+    );
+    void synthesize_v2_streaming(
+        const std::string& text,
+        const V2SynthParams& params,
+        AudioCallback callback
+    );
+    std::vector<float> synthesize_v2_unblanked_tokens(
+        const std::vector<uint8_t>& tokens,
+        const V2SynthParams& params = {}
+    );
+    std::vector<float> synthesize_v2_blanked_tokens(
+        const std::vector<uint8_t>& tokens,
+        const V2SynthParams& params = {}
+    );
+    void synthesize_v2_blanked_tokens_streaming(
+        const std::vector<uint8_t>& tokens,
+        const V2SynthParams& params,
+        AudioCallback callback,
+        const std::vector<float>* fixed_noise = nullptr
+    );
+    int v2_latent_channels() const;
+
     int sample_rate() const { return 24000; }
 
     // Backend management
@@ -91,6 +121,10 @@ private:
     AcousticConfig acoustic_config_;
     std::string deferred_vocoder_path_;
     bool load_vocoder_now(const std::string& path);
+    std::unique_ptr<ModelLoader> v2_loader_;
+    std::unique_ptr<V2Frontend> v2_frontend_;
+    std::unique_ptr<V2Model> v2_model_;
+    std::string v2_model_path_;
 };
 
 } // namespace inflect

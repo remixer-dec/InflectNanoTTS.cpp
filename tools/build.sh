@@ -34,7 +34,7 @@ COMMON_FLAGS=(
   -DNDEBUG
   -DGGML_USE_CPU
   -DGGML_SCHED_MAX_COPIES=4
-  -DGGML_VERSION=\"0.15.1\"
+  -DGGML_VERSION=\"0.17.0\"
   -DGGML_COMMIT=\"vendored\"
   -I"${ROOT_DIR}"
   -I"${ROOT_DIR}/ggml/include"
@@ -44,6 +44,9 @@ COMMON_FLAGS=(
 
 if [[ "${INFLECT_LOW_MEMORY:-0}" == "1" ]]; then
   COMMON_FLAGS+=(-DINFLECT_LOW_MEMORY)
+fi
+if [[ "${INFLECT_V2_ESPEAK_FALLBACK:-0}" == "1" ]]; then
+  COMMON_FLAGS+=(-DINFLECT_V2_ESPEAK_FALLBACK)
 fi
 
 case "${os_name}" in
@@ -75,6 +78,9 @@ CXX_SOURCES=(
   src/acoustic_model.cpp
   src/vocoder_model.cpp
   src/text_frontend.cpp
+  src/v2_symbols.cpp
+  src/v2_frontend.cpp
+  src/v2_model.cpp
   ggml/src/ggml.cpp
   ggml/src/ggml-backend.cpp
   ggml/src/ggml-backend-meta.cpp

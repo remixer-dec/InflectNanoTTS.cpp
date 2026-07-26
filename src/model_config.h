@@ -52,6 +52,8 @@ struct VocoderConfig {
         {1, 3, 5}, {1, 3, 5}, {1, 3, 5}
     };
     std::string activation = "snake";
+    std::string tensor_prefix = "generator";
+    bool optional_biases = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -67,6 +69,13 @@ struct SynthParams {
     int   vocoder_chunk_frames = 0;
     std::string vocoder_backend;
     int griffin_lim_iterations = INFLECT_GRIFFIN_LIM_ITERS;
+};
+
+struct V2SynthParams {
+    float speed = 1.0f;
+    float variation = 0.667f;
+    uint64_t seed = 0;
+    int decoder_chunk_frames = 32;
 };
 
 // ─────────────────────────────────────────────────────────────────────────

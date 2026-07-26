@@ -572,6 +572,7 @@ static ggml_tensor* conv1d_vocoder(
     int stride,
     int padding,
     int dilation,
+    bool apply_optional_biases,
     std::vector<VocoderQuantConv1dOpData>& op_data,
     const char* profile_label
 ) {
@@ -615,7 +616,11 @@ static ggml_tensor* conv1d_vocoder(
     }
     ggml_tensor* y = ggml_mul_mat(gctx, weight, cols);
     y = ggml_cont(gctx, ggml_transpose(gctx, y));
-    return ggml_reshape_3d(gctx, y, im2col->ne[1], out_ch, im2col->ne[2]);
+    y = ggml_reshape_3d(gctx, y, im2col->ne[1], out_ch, im2col->ne[2]);
+    if (apply_optional_biases && bias != nullptr) {
+        y = add_channel_bias(gctx, y, bias);
+    }
+    return y;
 #endif
 }
 
@@ -837,23 +842,35 @@ bool VocoderModel::load(ModelLoader& loader) {
         ok = false;
         return nullptr;
     };
+    auto maybe = [&](const std::string& name) -> ggml_tensor* {
+        if (loader.has_tensor(name)) return loader.get_tensor(name);
+        return nullptr;
+    };
+    const std::string root = config_.tensor_prefix.empty()
+                                 ? std::string()
+                                 : config_.tensor_prefix + ".";
 
     // ── Conv pre ────────────────────────────────────────────────────
     // Converter folds weight_norm, so runtime expects plain *.weight tensors.
     {
-        weights_.conv_pre_w = get("generator.conv_pre.weight");
-        weights_.conv_pre_b = get("generator.conv_pre.bias");
+        weights_.conv_pre_w = get(root + "conv_pre.weight");
+        weights_.conv_pre_b = config_.optional_biases
+                                  ? maybe(root + "conv_pre.bias")
+                                  : get(root + "conv_pre.bias");
     }
 
     // ── Upsampling layers ───────────────────────────────────────────
     for (int i = 0; i < n_ups; i++) {
-        std::string prefix = "generator.ups." + std::to_string(i);
+        std::string prefix = root + "ups." + std::to_string(i);
         weights_.ups_w[i] = get(prefix + ".weight");
-        weights_.ups_b[i] = get(prefix + ".bias");
+        weights_.ups_b[i] = config_.optional_biases
+                                ? maybe(prefix + ".bias")
+                                : get(prefix + ".bias");
 
-        // Snake alpha
-        std::string act_prefix = "generator.up_acts." + std::to_string(i);
-        weights_.up_acts_alpha[i] = get(act_prefix + ".log_alpha");
+        if (config_.activation == "snake") {
+            std::string act_prefix = root + "up_acts." + std::to_string(i);
+            weights_.up_acts_alpha[i] = get(act_prefix + ".log_alpha");
+        }
     }
 
     // ── Residual blocks ─────────────────────────────────────────────
@@ -864,33 +881,45 @@ bool VocoderModel::load(ModelLoader& loader) {
 
             for (int c = 0; c < 3; c++) {
                 // convs1: dilated conv, weight [K, out, out]
-                std::string p1 = "generator.resblocks." + std::to_string(rb_idx) +
+                std::string p1 = root + "resblocks." + std::to_string(rb_idx) +
                     ".convs1." + std::to_string(c);
                 rb.convs1_w.push_back(get(p1 + ".weight"));
-                rb.convs1_b.push_back(get(p1 + ".bias"));
+                rb.convs1_b.push_back(config_.optional_biases
+                                         ? maybe(p1 + ".bias")
+                                         : get(p1 + ".bias"));
 
                 // convs2: dilation=1 conv, weight [K, out, out]
-                std::string p2 = "generator.resblocks." + std::to_string(rb_idx) +
+                std::string p2 = root + "resblocks." + std::to_string(rb_idx) +
                     ".convs2." + std::to_string(c);
                 rb.convs2_w.push_back(get(p2 + ".weight"));
-                rb.convs2_b.push_back(get(p2 + ".bias"));
+                rb.convs2_b.push_back(config_.optional_biases
+                                         ? maybe(p2 + ".bias")
+                                         : get(p2 + ".bias"));
 
-                // Snake alphas
-                rb.acts1_alpha.push_back(get(
-                    "generator.resblocks." + std::to_string(rb_idx) +
-                    ".acts1." + std::to_string(c) + ".log_alpha"));
-                rb.acts2_alpha.push_back(get(
-                    "generator.resblocks." + std::to_string(rb_idx) +
-                    ".acts2." + std::to_string(c) + ".log_alpha"));
+                if (config_.activation == "snake") {
+                    rb.acts1_alpha.push_back(get(
+                        root + "resblocks." + std::to_string(rb_idx) +
+                        ".acts1." + std::to_string(c) + ".log_alpha"));
+                    rb.acts2_alpha.push_back(get(
+                        root + "resblocks." + std::to_string(rb_idx) +
+                        ".acts2." + std::to_string(c) + ".log_alpha"));
+                } else {
+                    rb.acts1_alpha.push_back(nullptr);
+                    rb.acts2_alpha.push_back(nullptr);
+                }
             }
         }
     }
 
     // ── Post layers ─────────────────────────────────────────────────
     {
-        weights_.conv_post_w = get("generator.conv_post.weight");
-        weights_.conv_post_b = get("generator.conv_post.bias");
-        weights_.post_act_alpha = get("generator.post_act.log_alpha");
+        weights_.conv_post_w = get(root + "conv_post.weight");
+        weights_.conv_post_b = config_.optional_biases
+                                   ? maybe(root + "conv_post.bias")
+                                   : get(root + "conv_post.bias");
+        if (config_.activation == "snake") {
+            weights_.post_act_alpha = get(root + "post_act.log_alpha");
+        }
     }
 
     if (!ok) {
@@ -955,17 +984,23 @@ ggml_tensor* VocoderModel::build_resblock(
         int pad2 = (K - 1) / 2; // dilation=1 for convs2
 
         // a1(x)
-        ggml_tensor* y = snake(gctx, x, w.acts1_alpha[i]);
+        ggml_tensor* y = config_.activation == "snake"
+                             ? snake(gctx, x, w.acts1_alpha[i])
+                             : ggml_leaky_relu(gctx, x, 0.1f, false);
         // c1(y) — dilated conv
         y = conv1d_vocoder(gctx, w.convs1_w[i], w.convs1_b[i],
                            y, K, 1, pad1, dilation,
+                           config_.optional_biases,
                            quant_conv1d_ops_, "resblock.convs1");
 
         // a2(y)
-        y = snake(gctx, y, w.acts2_alpha[i]);
+        y = config_.activation == "snake"
+                ? snake(gctx, y, w.acts2_alpha[i])
+                : ggml_leaky_relu(gctx, y, 0.1f, false);
         // c2(y) — dilation=1 conv
         y = conv1d_vocoder(gctx, w.convs2_w[i], w.convs2_b[i],
                            y, K, 1, pad2, 1,
+                           config_.optional_biases,
                            quant_conv1d_ops_, "resblock.convs2");
 
         x = ggml_add(gctx, x, y);
@@ -1015,6 +1050,7 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
 
     x = conv1d_vocoder(gctx, weights_.conv_pre_w, weights_.conv_pre_b,
                        x, 7, 1, 3, 1,
+                       config_.optional_biases,
                        quant_conv1d_ops_, "conv_pre");
     capture("vocoder_conv_pre", x);
 
@@ -1024,14 +1060,18 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
         int K = config_.upsample_kernel_sizes[i];
         int pad = (K - rate) / 2;
 
-        // Snake activation before upsampling
-        x = snake(gctx, x, weights_.up_acts_alpha[i]);
+        x = config_.activation == "snake"
+                ? snake(gctx, x, weights_.up_acts_alpha[i])
+                : ggml_leaky_relu(gctx, x, 0.1f, false);
 
         // Transposed conv: upsampling
         // ggml_conv_transpose_1d(ctx, kernel, input, stride, padding, dilation)
         // This GGML revision only supports p0=0 and d0=1 for conv_transpose_1d.
         x = quant_or_f16_conv_transpose_1d(gctx, weights_.ups_w[i], x, K, rate, pad,
                                            quant_conv_transpose_ops_, "upsample");
+        if (config_.optional_biases && weights_.ups_b[i] != nullptr) {
+            x = add_channel_bias(gctx, x, weights_.ups_b[i]);
+        }
         capture("vocoder_upsample_" + std::to_string(i), x);
 
         // Residual blocks (sum and average)
@@ -1052,9 +1092,13 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     }
 
     // ── Post ────────────────────────────────────────────────────────
-    x = snake(gctx, x, weights_.post_act_alpha);
+    x = config_.activation == "snake"
+            ? snake(gctx, x, weights_.post_act_alpha)
+            : ggml_leaky_relu(gctx, x, 0.01f, false);
+    capture("vocoder_post_activation", x);
     x = conv1d_vocoder(gctx, weights_.conv_post_w, weights_.conv_post_b,
                        x, 7, 1, 3, 1,
+                       config_.optional_biases,
                        quant_conv1d_ops_, "conv_post");
     capture("vocoder_conv_post", x);
     x = ggml_tanh(gctx, x);
@@ -1169,6 +1213,7 @@ std::vector<float> VocoderModel::vocode(
             }
             dump_names.push_back("vocoder_resblock_avg_" + std::to_string(i));
         }
+        dump_names.push_back("vocoder_post_activation");
         dump_names.push_back("vocoder_conv_post");
         dump_names.push_back("vocoder_tanh");
 
@@ -1237,7 +1282,11 @@ void VocoderModel::vocode_streaming(
     AudioCallback callback
 ) {
     constexpr int kLowMemoryMaxChunkFrames = 96;
-    constexpr int kLowMemoryMinChunkFrames = 24;
+    constexpr int kV1LowMemoryMinChunkFrames = 24;
+    constexpr int kV2LowMemoryMinChunkFrames = 1;
+    const bool legacy_v1_chunking =
+        config_.activation == "snake" &&
+        config_.tensor_prefix == "generator";
 
 #if defined(INFLECT_LOW_MEMORY)
     if (chunk_frames <= 0) {
@@ -1246,10 +1295,15 @@ void VocoderModel::vocode_streaming(
     if (chunk_frames > kLowMemoryMaxChunkFrames) {
         chunk_frames = kLowMemoryMaxChunkFrames;
     }
-    if (n_frames > kLowMemoryMaxChunkFrames) {
+    if (legacy_v1_chunking && n_frames > kLowMemoryMaxChunkFrames) {
         chunk_frames = kLowMemoryMaxChunkFrames;
-    } else if (chunk_frames > 0 && chunk_frames < kLowMemoryMinChunkFrames) {
-        chunk_frames = kLowMemoryMinChunkFrames;
+    } else {
+        const int minimum = legacy_v1_chunking
+                                ? kV1LowMemoryMinChunkFrames
+                                : kV2LowMemoryMinChunkFrames;
+        if (chunk_frames > 0 && chunk_frames < minimum) {
+            chunk_frames = minimum;
+        }
     }
     fprintf(stderr, "[VocoderModel] low-memory chunk policy frames=%d chunk_frames=%d\n",
             n_frames, chunk_frames);
@@ -1262,92 +1316,147 @@ void VocoderModel::vocode_streaming(
         return;
     }
 
-    // Overlap-discard: process chunks with overlap to handle
-    // convolution receptive fields at boundaries.
-    //
-    // The receptive field of the vocoder is determined by the
-    // convolutions in the resblocks. For kernel sizes (3, 7, 11)
-    // with dilations (1, 3, 5), the total receptive field is:
-    //   RF = sum over all layers of (K-1) * dilation
-    // This is roughly 100-200 frames.
-    //
-    // We use an overlap of 50% of the receptive field and discard
-    // the edges of each chunk.
-
-    int overlap = 64; // Conservative overlap for this vocoder
+    if (legacy_v1_chunking) {
+        int overlap = 64;
 #if defined(INFLECT_LOW_MEMORY)
-    overlap = 4;
+        overlap = 4;
 #endif
-    if (chunk_frames <= overlap) {
-        auto audio = vocode(mel, n_mels, n_frames, backend);
-        callback(audio.data(), audio.size());
+        if (chunk_frames <= overlap) {
+            auto audio = vocode(mel, n_mels, n_frames, backend);
+            callback(audio.data(), audio.size());
+            return;
+        }
+        const int hop = chunk_frames - overlap;
+        const int upsample = total_upsample();
+        std::vector<float> mel_chunk;
+        mel_chunk.reserve(n_mels * chunk_frames);
+        std::vector<float> audio_chunk;
+        std::vector<float> pending_tail;
+        std::vector<float> blended;
+
+        int chunk_index = 0;
+        for (int start = 0; start < n_frames; start += hop) {
+            const uint32_t chunk_start_ms = now_ms();
+            const int end = std::min(start + chunk_frames, n_frames);
+            const int chunk_len = end - start;
+            fprintf(stderr,
+                    "[VocoderModel] chunk %d begin mel_start=%d frames=%d\n",
+                    chunk_index, start, chunk_len);
+
+            mel_chunk.resize(n_mels * chunk_len);
+            for (int m = 0; m < n_mels; m++) {
+                for (int t = 0; t < chunk_len; t++) {
+                    mel_chunk[m + n_mels * t] =
+                        mel[m + n_mels * (start + t)];
+                }
+            }
+
+            audio_chunk = vocode(
+                mel_chunk, n_mels, chunk_len, backend);
+            const int discard_start =
+                start > 0 ? overlap * upsample / 2 : 0;
+            const int discard_end =
+                end < n_frames ? overlap * upsample / 2 : 0;
+            const int out_start = discard_start;
+            const int out_end =
+                static_cast<int>(audio_chunk.size()) - discard_end;
+
+            if (out_end > out_start) {
+                const int out_len = out_end - out_start;
+                int blended_len = 0;
+                if (!pending_tail.empty()) {
+                    blended_len = std::min<int>(
+                        pending_tail.size(), out_len);
+                    blended.resize(blended_len);
+                    for (int i = 0; i < blended_len; ++i) {
+                        const float amount =
+                            static_cast<float>(i + 1) /
+                            static_cast<float>(blended_len + 1);
+                        blended[i] =
+                            pending_tail[i] * (1.0f - amount) +
+                            audio_chunk[out_start + i] * amount;
+                    }
+                    callback(blended.data(), blended.size());
+                }
+                if (out_len > blended_len) {
+                    callback(
+                        audio_chunk.data() + out_start + blended_len,
+                        out_len - blended_len);
+                }
+            } else if (!pending_tail.empty() && end >= n_frames) {
+                callback(pending_tail.data(), pending_tail.size());
+                pending_tail.clear();
+            }
+
+            if (discard_end > 0) {
+                pending_tail.assign(
+                    audio_chunk.begin() + out_end, audio_chunk.end());
+            } else {
+                pending_tail.clear();
+            }
+            fprintf(stderr,
+                    "[VocoderModel] chunk %d done elapsed_ms=%u\n",
+                    chunk_index,
+                    static_cast<unsigned>(now_ms() - chunk_start_ms));
+            ++chunk_index;
+            if (end >= n_frames) break;
+        }
         return;
     }
-    int hop = chunk_frames - overlap;
+
+    // Receptive-field-derived latent halo for the v2 HiFi-GAN topology.
+    // Back-propagating one output core through conv_post(k=7), the three
+    // ResBlock1 pairs at each stage (max k=11, d=1/3/5), transposed
+    // convolutions (8/8/2/2), and conv_pre(k=7) reaches at most 14 latent
+    // frames beyond either edge. Decode core+halo and emit the core once;
+    // no overlap blending or cumulative sample shift is needed.
+    constexpr int halo_left_frames = 14;
+    constexpr int halo_right_frames = 13;
     int upsample = total_upsample();
     std::vector<float> mel_chunk;
-    mel_chunk.reserve(n_mels * chunk_frames);
+    mel_chunk.reserve(
+        static_cast<size_t>(n_mels) *
+        (chunk_frames + halo_left_frames + halo_right_frames));
     std::vector<float> audio_chunk;
-    std::vector<float> pending_tail;
-    std::vector<float> blended;
 
     int chunk_index = 0;
-    for (int start = 0; start < n_frames; start += hop) {
+    for (int core_start = 0; core_start < n_frames;
+         core_start += chunk_frames) {
         const uint32_t chunk_start_ms = now_ms();
-        int end = std::min(start + chunk_frames, n_frames);
-        int chunk_len = end - start;
-        fprintf(stderr, "[VocoderModel] chunk %d begin mel_start=%d frames=%d\n",
-                chunk_index, start, chunk_len);
+        const int core_end = std::min(core_start + chunk_frames, n_frames);
+        const int input_start =
+            std::max(0, core_start - halo_left_frames);
+        const int input_end =
+            std::min(n_frames, core_end + halo_right_frames);
+        const int input_frames = input_end - input_start;
+        fprintf(stderr,
+                "[VocoderModel] chunk %d begin core=[%d,%d) input=[%d,%d)\n",
+                chunk_index, core_start, core_end, input_start, input_end);
 
-        // Extract mel chunk
-        mel_chunk.resize(n_mels * chunk_len);
+        mel_chunk.resize(static_cast<size_t>(n_mels) * input_frames);
         for (int m = 0; m < n_mels; m++) {
-            for (int t = 0; t < chunk_len; t++) {
-                mel_chunk[m + n_mels * t] = mel[m + n_mels * (start + t)];
+            for (int t = 0; t < input_frames; t++) {
+                mel_chunk[m + n_mels * t] =
+                    mel[m + n_mels * (input_start + t)];
             }
         }
 
-        // Vocode chunk
-        audio_chunk = vocode(mel_chunk, n_mels, chunk_len, backend);
-
-        // Determine which samples to output (discard overlap region)
-        int discard_start = (start > 0) ? overlap * upsample / 2 : 0;
-        int discard_end = (end < n_frames) ? overlap * upsample / 2 : 0;
-        int out_start = discard_start;
-        int out_end = audio_chunk.size() - discard_end;
-
-        if (out_end > out_start) {
-            const int out_len = out_end - out_start;
-            int blended_len = 0;
-            if (!pending_tail.empty()) {
-                blended_len = std::min<int>(pending_tail.size(), out_len);
-                blended.resize(blended_len);
-                for (int i = 0; i < blended_len; i++) {
-                    const float t = (float)(i + 1) / (float)(blended_len + 1);
-                    blended[i] = pending_tail[i] * (1.0f - t) + audio_chunk[out_start + i] * t;
-                }
-                callback(blended.data(), blended.size());
-            }
-            if (out_len > blended_len) {
-                callback(audio_chunk.data() + out_start + blended_len, out_len - blended_len);
-            }
-        } else if (!pending_tail.empty() && end >= n_frames) {
-            callback(pending_tail.data(), pending_tail.size());
-            pending_tail.clear();
+        audio_chunk = vocode(
+            mel_chunk, n_mels, input_frames, backend);
+        const size_t keep_start =
+            static_cast<size_t>(core_start - input_start) * upsample;
+        const size_t keep_count =
+            static_cast<size_t>(core_end - core_start) * upsample;
+        if (keep_start + keep_count > audio_chunk.size()) {
+            std::fprintf(stderr,
+                         "[VocoderModel] haloed chunk output is too short\n");
+            return;
         }
-
-        if (discard_end > 0) {
-            pending_tail.assign(audio_chunk.begin() + out_end, audio_chunk.end());
-        } else {
-            pending_tail.clear();
-        }
+        callback(audio_chunk.data() + keep_start, keep_count);
         fprintf(stderr, "[VocoderModel] chunk %d done elapsed_ms=%u\n",
                 chunk_index,
                 (unsigned)(now_ms() - chunk_start_ms));
         chunk_index++;
-        if (end >= n_frames) {
-            break;
-        }
     }
 }
 

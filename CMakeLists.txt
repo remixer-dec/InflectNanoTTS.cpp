@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(inflect-nano-tts LANGUAGES C CXX)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +14,9 @@ set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
 option(INFLECT_LOW_MEMORY "Enable compile-time low-memory defaults for edge devices" OFF)
+option(INFLECT_V2_ESPEAK_FALLBACK
+       "Enable CPU-only eSpeak-ng fallback for V2 words missing from IVL2"
+       OFF)
 
 string(TOLOWER "${CMAKE_SYSTEM_NAME}" INFLECT_TARGET_OS)
 if(INFLECT_TARGET_OS STREQUAL "darwin")
@@ -28,6 +32,10 @@ endif()
 
 set(INFLECT_TARGET_TRIPLE "${INFLECT_TARGET_OS}-${INFLECT_TARGET_ARCH}")
 
+if(INFLECT_LOW_MEMORY)
+    add_compile_definitions(INFLECT_LOW_MEMORY)
+endif()
+
 add_subdirectory(ggml)
 
 add_executable(inflect-nano
@@ -38,6 +46,9 @@ add_executable(inflect-nano
     src/acoustic_model.cpp
     src/vocoder_model.cpp
     src/text_frontend.cpp
+    src/v2_symbols.cpp
+    src/v2_frontend.cpp
+    src/v2_model.cpp
 )
 
 target_include_directories(inflect-nano PRIVATE
@@ -56,6 +67,18 @@ foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
     )
 endforeach()
 
-if(INFLECT_LOW_MEMORY)
-    target_compile_definitions(inflect-nano PRIVATE INFLECT_LOW_MEMORY)
+if(INFLECT_V2_ESPEAK_FALLBACK)
+    target_compile_definitions(inflect-nano PRIVATE INFLECT_V2_ESPEAK_FALLBACK)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(test-v2-frontend
+        tests/test_v2_frontend.cpp
+        src/v2_frontend.cpp
+        src/v2_symbols.cpp
+    )
+    target_include_directories(test-v2-frontend PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME v2-frontend COMMAND test-v2-frontend)
 endif()

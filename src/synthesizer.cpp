@@ -3,6 +3,9 @@
 #include "griffin_lim_vocoder.h"
 #include "vocoder_model.h"
 #include "text_frontend.h"
+#include "v2_frontend.h"
+#include "v2_model.h"
+#include "v2_symbols.h"
 #include "model_loader.h"
 #include "memory_trace.h"
 #include "utils.h"
@@ -16,6 +19,7 @@
 #include <sys/types.h>
 #include <thread>
 #include <vector>
+#include <algorithm>
 
 #ifndef INFLECT_VOCODER_BACKEND
 #define INFLECT_VOCODER_BACKEND neural
@@ -300,6 +304,331 @@ bool Synthesizer::load_cmudict(const std::string& path) {
     const bool ok = frontend_->load_cmudict(path);
     mem_trace_rss("after cmudict load");
     return ok;
+}
+
+bool Synthesizer::load_v2(const std::string& model_path,
+                          const std::string& lexicon_path) {
+    auto loader = std::make_unique<ModelLoader>();
+#if defined(INFLECT_LOW_MEMORY)
+    static const std::vector<std::string> duration_prefixes = {
+        "enc_p.", "dp.",
+    };
+    if (!loader->load_selected(model_path, duration_prefixes)) return false;
+#else
+    if (!loader->load(model_path)) return false;
+#endif
+    auto frontend = std::make_unique<V2Frontend>();
+    if (!frontend->load_lexicon(lexicon_path)) return false;
+    if (loader->get_string("inflect.v2.symbol_hash") != v2::kSymbolHashHex) {
+        fprintf(stderr,
+                "[Synthesizer] V2 model/lexicon symbol hash mismatch model=%s runtime=%s\n",
+                loader->get_string("inflect.v2.symbol_hash", "<missing>").c_str(),
+                v2::kSymbolHashHex);
+        return false;
+    }
+    auto model = std::make_unique<V2Model>();
+#if defined(INFLECT_LOW_MEMORY)
+    if (!model->load_duration(*loader)) return false;
+#else
+    if (!model->load(*loader)) return false;
+#endif
+    v2_loader_ = std::move(loader);
+    v2_frontend_ = std::move(frontend);
+    v2_model_ = std::move(model);
+    v2_model_path_ = model_path;
+    fprintf(stderr,
+            "[Synthesizer] Loaded Inflect v2 model=%s lexicon=%s symbols=%s\n",
+            model_path.c_str(), lexicon_path.c_str(), v2::kSymbolHashHex);
+    mem_trace_rss("after v2 load");
+    return true;
+}
+
+V2FrontendResult Synthesizer::v2_text_to_tokens(const std::string& text) {
+    if (!v2_frontend_) {
+        fprintf(stderr, "[Synthesizer] V2 frontend not loaded\n");
+        return {};
+    }
+    return v2_frontend_->process(text);
+}
+
+int Synthesizer::v2_latent_channels() const {
+    return v2_model_ ? v2_model_->latent_channels() : 0;
+}
+
+static std::vector<std::string> split_v2_text(const std::string& input,
+                                               size_t limit = 280) {
+    std::string normalized;
+    normalized.reserve(input.size());
+    bool space = false;
+    for (unsigned char c : input) {
+        if (std::isspace(c)) {
+            space = !normalized.empty();
+        } else {
+            if (space) normalized.push_back(' ');
+            normalized.push_back(static_cast<char>(c));
+            space = false;
+        }
+    }
+    std::vector<std::string> sentences;
+    size_t start = 0;
+    for (size_t i = 0; i < normalized.size(); ++i) {
+        if (std::strchr(".!?;:", normalized[i]) &&
+            i + 1 < normalized.size() && normalized[i + 1] == ' ') {
+            sentences.push_back(normalized.substr(start, i + 1 - start));
+            start = i + 2;
+            i = start ? start - 1 : 0;
+        }
+    }
+    if (start < normalized.size()) sentences.push_back(normalized.substr(start));
+    if (sentences.empty() && !normalized.empty()) sentences.push_back(normalized);
+
+    std::vector<std::string> chunks;
+    for (std::string sentence : sentences) {
+        while (sentence.size() > limit) {
+            const size_t search_end = std::min(sentence.size(), limit + 1);
+            size_t punctuation = std::string::npos;
+            for (char mark : {',', ';', ':'}) {
+                const size_t found = sentence.rfind(mark, search_end - 1);
+                if (found != std::string::npos &&
+                    (punctuation == std::string::npos || found > punctuation)) {
+                    punctuation = found;
+                }
+            }
+            size_t split = punctuation != std::string::npos &&
+                                   punctuation >= limit / 2
+                               ? punctuation + 1
+                               : sentence.rfind(' ', search_end - 1);
+            if (split == std::string::npos || split < limit / 2) split = limit;
+            chunks.push_back(sentence.substr(0, split));
+            sentence.erase(0, split);
+            while (!sentence.empty() && sentence.front() == ' ') sentence.erase(0, 1);
+        }
+        if (!sentence.empty()) chunks.push_back(std::move(sentence));
+    }
+    return chunks;
+}
+
+static float v2_boundary_pause(const std::string& chunk) {
+    const char ending = chunk.empty() ? '\0' : chunk.back();
+    switch (ending) {
+        case '?': return 0.28f;
+        case '!': return 0.24f;
+        case '.': return 0.22f;
+        case ';': return 0.16f;
+        case ':': return 0.13f;
+        case ',': return 0.09f;
+        default: return 0.08f;
+    }
+}
+
+struct V2FadeSink {
+    AudioCallback callback;
+    std::vector<float> pending;
+    size_t start_index = 0;
+    static constexpr size_t kFadeSamples = 120;
+
+    explicit V2FadeSink(AudioCallback sink) : callback(std::move(sink)) {}
+
+    void write(const float* samples, size_t count) {
+        pending.reserve(pending.size() + count);
+        for (size_t i = 0; i < count; ++i, ++start_index) {
+            float value = std::max(-1.0f, std::min(1.0f, samples[i]));
+            if (start_index < kFadeSamples) {
+                const float gain = static_cast<float>(start_index) /
+                                   static_cast<float>(kFadeSamples - 1);
+                value *= gain;
+            }
+            pending.push_back(value);
+        }
+        if (pending.size() > kFadeSamples) {
+            const size_t emit = pending.size() - kFadeSamples;
+            callback(pending.data(), emit);
+            pending.erase(pending.begin(), pending.begin() + emit);
+        }
+    }
+
+    void finish() {
+        const size_t fade = std::min(kFadeSamples, pending.size() / 2);
+        if (fade > 0) {
+            for (size_t i = 0; i < fade; ++i) {
+                const float gain = static_cast<float>(fade - 1 - i) /
+                                   static_cast<float>(std::max<size_t>(1, fade - 1));
+                pending[pending.size() - fade + i] *= gain;
+            }
+        }
+        if (!pending.empty()) callback(pending.data(), pending.size());
+        pending.clear();
+    }
+};
+
+void Synthesizer::synthesize_v2_blanked_tokens_streaming(
+    const std::vector<uint8_t>& tokens,
+    const V2SynthParams& params,
+    AudioCallback callback,
+    const std::vector<float>* fixed_noise
+) {
+    if (!g_backend || !callback
+#if defined(INFLECT_LOW_MEMORY)
+        || v2_model_path_.empty()
+#else
+        || !v2_model_
+#endif
+    ) {
+        fprintf(stderr, "[Synthesizer] V2 model/backend not loaded\n");
+        return;
+    }
+    if (params.speed < 0.5f || params.speed > 2.0f ||
+        params.variation < 0.0f || params.variation > 1.0f) {
+        fprintf(stderr,
+                "[Synthesizer] V2 controls out of range speed=%.3f variation=%.3f\n",
+                params.speed, params.variation);
+        return;
+    }
+    if (tokens.empty()) {
+        fprintf(stderr, "[Synthesizer] Empty V2 token sequence\n");
+        return;
+    }
+    for (uint8_t token : tokens) {
+        if (token >= v2::kSymbolCount) {
+            fprintf(stderr, "[Synthesizer] V2 token ID out of range: %u\n", token);
+            return;
+        }
+    }
+#if defined(INFLECT_LOW_MEMORY)
+    if (!v2_model_ || !v2_loader_) {
+        static const std::vector<std::string> duration_prefixes = {
+            "enc_p.", "dp.",
+        };
+        v2_loader_ = std::make_unique<ModelLoader>();
+        v2_model_ = std::make_unique<V2Model>();
+        if (!v2_loader_->load_selected(v2_model_path_, duration_prefixes) ||
+            !v2_model_->load_duration(*v2_loader_)) {
+            fprintf(stderr, "[Synthesizer] Failed to load V2 duration stage\n");
+            v2_model_.reset();
+            v2_loader_.reset();
+            return;
+        }
+    }
+#endif
+    V2DurationFlowOutput latent = v2_model_->duration_and_flow(
+        tokens, params.speed, params.variation, params.seed, fixed_noise,
+#if defined(INFLECT_LOW_MEMORY)
+        false
+#else
+        true
+#endif
+    );
+    if (latent.frames <= 0) {
+#if defined(INFLECT_LOW_MEMORY)
+        v2_model_.reset();
+        v2_loader_.reset();
+#endif
+        return;
+    }
+#if defined(INFLECT_LOW_MEMORY)
+    v2_loader_.reset();
+    mem_release_to_os();
+    runtime_trace_heap("v2 duration released");
+    for (int flow = 6; flow >= 0; flow -= 2) {
+        const std::string prefix =
+            "flow.flows." + std::to_string(flow) + ".";
+        v2_loader_ = std::make_unique<ModelLoader>();
+        if (!v2_loader_->load_selected(v2_model_path_, {prefix}) ||
+            !v2_model_->load_flow_block(*v2_loader_, flow) ||
+            !v2_model_->reverse_flow_block(latent, flow)) {
+            fprintf(stderr, "[Synthesizer] Failed V2 reverse flow block %d\n", flow);
+            v2_model_.reset();
+            v2_loader_.reset();
+            return;
+        }
+        v2_loader_.reset();
+        mem_release_to_os();
+        runtime_trace_heap(("v2 flow " + std::to_string(flow) + " released").c_str());
+    }
+    v2_loader_ = std::make_unique<ModelLoader>();
+    if (!v2_loader_->load_selected(v2_model_path_, {"dec."}) ||
+        !v2_model_->load_decoder(*v2_loader_)) {
+        fprintf(stderr, "[Synthesizer] Failed to load V2 decoder stage\n");
+        v2_model_.reset();
+        v2_loader_.reset();
+        return;
+    }
+#endif
+    V2FadeSink sink{std::move(callback)};
+    v2_model_->decode_streaming(
+        latent.latent, latent.frames, params.decoder_chunk_frames, g_backend,
+        [&](const float* samples, size_t count) { sink.write(samples, count); });
+    sink.finish();
+#if defined(INFLECT_LOW_MEMORY)
+    v2_model_.reset();
+    v2_loader_.reset();
+    mem_release_to_os();
+    runtime_trace_heap("v2 decoder released");
+#endif
+}
+
+std::vector<float> Synthesizer::synthesize_v2_blanked_tokens(
+    const std::vector<uint8_t>& tokens,
+    const V2SynthParams& params
+) {
+    std::vector<float> audio;
+    synthesize_v2_blanked_tokens_streaming(
+        tokens, params,
+        [&](const float* samples, size_t count) {
+            audio.insert(audio.end(), samples, samples + count);
+        });
+    return audio;
+}
+
+std::vector<float> Synthesizer::synthesize_v2_unblanked_tokens(
+    const std::vector<uint8_t>& tokens,
+    const V2SynthParams& params
+) {
+    return synthesize_v2_blanked_tokens(v2::intersperse_blanks(tokens), params);
+}
+
+void Synthesizer::synthesize_v2_streaming(
+    const std::string& text,
+    const V2SynthParams& params,
+    AudioCallback callback
+) {
+    if (!v2_frontend_ || !callback) {
+        fprintf(stderr, "[Synthesizer] V2 frontend not loaded\n");
+        return;
+    }
+    const auto chunks = split_v2_text(text);
+    if (chunks.empty()) {
+        fprintf(stderr, "[Synthesizer] V2 text must not be empty\n");
+        return;
+    }
+    std::vector<float> silence;
+    for (size_t index = 0; index < chunks.size(); ++index) {
+        if (index > 0) {
+            const size_t count = static_cast<size_t>(
+                std::lround(24000.0f * v2_boundary_pause(chunks[index - 1])));
+            silence.assign(count, 0.0f);
+            callback(silence.data(), silence.size());
+        }
+        V2FrontendResult frontend = v2_frontend_->process(chunks[index]);
+        if (frontend.blanked_tokens.empty()) continue;
+        V2SynthParams chunk_params = params;
+        chunk_params.seed += index;
+        synthesize_v2_blanked_tokens_streaming(
+            frontend.blanked_tokens, chunk_params, callback);
+    }
+}
+
+std::vector<float> Synthesizer::synthesize_v2(
+    const std::string& text,
+    const V2SynthParams& params
+) {
+    std::vector<float> audio;
+    synthesize_v2_streaming(
+        text, params,
+        [&](const float* samples, size_t count) {
+            audio.insert(audio.end(), samples, samples + count);
+        });
+    return audio;
 }
 
 TokenSequence Synthesizer::text_to_tokens(const std::string& text) {
