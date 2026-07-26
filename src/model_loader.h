@@ -29,6 +29,7 @@ public:
     int32_t     get_i32(const std::string& key, int32_t default_val = 0) const;
     float       get_f32(const std::string& key, float default_val = 0.0f) const;
     std::string get_string(const std::string& key, const std::string& default_val = "") const;
+    bool has_key(const std::string& key) const;
 
     // ── Contexts ───────────────────────────────────────────────────
     ggml_context*         ctx()     const { return ctx_; }

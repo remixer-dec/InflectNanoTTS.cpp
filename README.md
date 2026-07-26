@@ -7,7 +7,10 @@ Small C++/GGML port of the
 pipelines.
 
 This repo contains the runtime, conversion helpers, and parity/debug tooling. Currently only CPU inference is supported.
-Pre-quantized weights are available [here](https://huggingface.co/remixerdec/Inflect-Nano-v1-GGUF).
+Pre-quantized weights are available here:
+[V1-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v1-GGUF),
+[V2-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v2-GGUF), and
+[V2-Micro](https://huggingface.co/remixerdec/Inflect-Micro-v2-GGUF).
 
 ## Layout
 
