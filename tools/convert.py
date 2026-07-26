@@ -282,7 +282,7 @@ def build_ggml_quantizer():
         "-O2",
         "-DNDEBUG",
         "-DGGML_USE_CPU",
-        '-DGGML_VERSION="0.15.1"',
+        '-DGGML_VERSION="0.17.0"',
         '-DGGML_COMMIT="vendored"',
         "-I" + ROOT_DIR,
         "-I" + os.path.join(ROOT_DIR, "ggml", "include"),

@@ -16,7 +16,7 @@ index 5d1ca5ff..20347f5a 100644
 +
 +#endif // INFLECT_GGML_CPU_IMPL_H
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index eb8341c9..49dfcb5c 100644
+index 491316f7..9b7611d7 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
 @@ -76,11 +76,13 @@
@@ -31,9 +31,9 @@ index eb8341c9..49dfcb5c 100644
  float ggml_table_f32_e8m0_half[1 << 8];
 +#endif
  
- #if defined(__ARM_ARCH)
- struct ggml_arm_arch_features_type {
-@@ -3779,6 +3781,7 @@ void ggml_cpu_init(void) {
+ // precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
+ float ggml_table_f32_ue4m3[1 << 8];
+@@ -3829,6 +3831,7 @@ void ggml_cpu_init(void) {
  
      if (is_first_call) {
          // initialize GELU, Quick GELU, SILU and EXP F32 tables
@@ -41,7 +41,7 @@ index eb8341c9..49dfcb5c 100644
          {
              const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
  
-@@ -3801,24 +3804,27 @@ void ggml_cpu_init(void) {
+@@ -3856,24 +3859,27 @@ void ggml_cpu_init(void) {
              const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
  
              GGML_PRINT_DEBUG("%s: GELU, Quick GELU, SILU and EXP tables initialized in %f ms\n", __func__, (t_end - t_start)/1000.0);
@@ -82,7 +82,7 @@ index eb8341c9..49dfcb5c 100644
  #if defined(__ARM_ARCH)
          ggml_init_arm_arch_features();
 diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
-index 128883b4..924983a7 100644
+index 74631c28..2891ee9e 100644
 --- a/src/ggml-cpu/ggml-cpu.cpp
 +++ b/src/ggml-cpu/ggml-cpu.cpp
 @@ -7,6 +7,8 @@
@@ -121,7 +121,7 @@ index 128883b4..924983a7 100644
  
  static const struct ggml_backend_i ggml_backend_cpu_i = {
 diff --git a/src/ggml-cpu/simd-mappings.h b/src/ggml-cpu/simd-mappings.h
-index 62e68720..f00724cf 100644
+index fca5119e..8da6de86 100644
 --- a/src/ggml-cpu/simd-mappings.h
 +++ b/src/ggml-cpu/simd-mappings.h
 @@ -112,6 +112,7 @@ extern "C" {
@@ -132,11 +132,15 @@ index 62e68720..f00724cf 100644
  // precomputed f32 table for f16 (256 KB)
  // defined in ggml-cpu.c, initialized in ggml_cpu_init()
  extern float ggml_table_f32_f16[1 << 16];
-@@ -119,9 +120,10 @@ extern float ggml_table_f32_f16[1 << 16];
+@@ -119,13 +120,14 @@ extern float ggml_table_f32_f16[1 << 16];
  // precomputed f32 table for e8m0 half (1 KB)
  // defined in ggml-cpu.c, initialized in ggml_cpu_init()
  extern float ggml_table_f32_e8m0_half[1 << 8];
 +#endif
+ 
+ // precomputed f32 table for ue4m3 (1 KB)
+ // defined in ggml-cpu.c, initialized in ggml_cpu_init()
+ extern float ggml_table_f32_ue4m3[1 << 8];
  
  // Use lookup table for E8M0 on x86 (faster than bit manipulation)
 -#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
@@ -144,7 +148,7 @@ index 62e68720..f00724cf 100644
  #define GGML_CPU_E8M0_TO_FP32_HALF(x) ggml_table_f32_e8m0_half[(uint8_t)(x)]
  #else
  #define GGML_CPU_E8M0_TO_FP32_HALF(x) GGML_E8M0_TO_FP32_HALF(x)
-@@ -132,9 +134,13 @@ extern float ggml_table_f32_e8m0_half[1 << 8];
+@@ -143,9 +145,13 @@ extern float ggml_table_f32_ue4m3[1 << 8];
  // This is also true for POWER9.
  #if !defined(GGML_CPU_FP16_TO_FP32)
  inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
@@ -159,7 +163,7 @@ index 62e68720..f00724cf 100644
  
  #define GGML_CPU_FP16_TO_FP32(x) ggml_lookup_fp16_to_fp32(x)
 diff --git a/src/ggml-cpu/vec.cpp b/src/ggml-cpu/vec.cpp
-index 67b6b05c..da01246e 100644
+index ff2b636d..22fe2dd5 100644
 --- a/src/ggml-cpu/vec.cpp
 +++ b/src/ggml-cpu/vec.cpp
 @@ -2,11 +2,13 @@
@@ -264,7 +268,7 @@ index 5de9cb5b..e037adb1 100644
  }
  #else
  inline static void ggml_vec_gelu_quick_f32(const int n, float * y, const float * x) {
-@@ -1413,6 +1439,11 @@ inline static void ggml_vec_reglu_f16 (const int n, ggml_fp16_t * y, const ggml_
+@@ -1413,6 +1439,11 @@ inline static void ggml_vec_reglu_f16 (const int n, float * y, const float * x,
  
  #ifdef GGML_GELU_FP16
  inline static void ggml_vec_geglu_f32(const int n, float * y, const float * x, const float * g) {
