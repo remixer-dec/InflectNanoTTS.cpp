@@ -41,7 +41,7 @@ With the fallback script:
 
 ### Low-memory build
 
-For edge devices, compile with `INFLECT_LOW_MEMORY`. This enables flash/file-backed CMU lookup, defers vocoder loading until after acoustic inference, releases acoustic memory before vocoding, and uses smaller vocoder chunks. Low-memory build currently stays under 9MB of RAM during inference on Linux and under 7MB on ESP32's PSRAM. Use `INFLECT_MEM_TRACE=1` env. variable to trace memory usage.
+For edge devices, compile with `INFLECT_LOW_MEMORY`. This enables flash/file-backed CMU lookup, defers vocoder loading until after acoustic inference, releases acoustic memory before vocoding, and uses smaller vocoder chunks. Low-memory build currently stays under 9MB of RAM during inference on Linux and under 7MB on ESP32's PSRAM. On an ESP32, Inflect-Nano v1 with the Griffin-Lim vocoder takes around 6 seconds from cold start to a spoken single word. Use `INFLECT_MEM_TRACE=1` env. variable to trace memory usage.
 
 ```bash
 cmake -S . -B build-lowmem -DINFLECT_LOW_MEMORY=ON
