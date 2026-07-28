@@ -193,6 +193,7 @@ static VocodeOpProfile g_vocode_profile;
 
 struct VocodePackedProfile {
     std::atomic<uint64_t> input_gather_cycles{0};
+    std::atomic<uint64_t> reused_input_blocks{0};
     std::atomic<uint64_t> input_quant_cycles{0};
     std::atomic<uint64_t> input_max_cycles{0};
     std::atomic<uint64_t> input_scale_cycles{0};
@@ -236,6 +237,7 @@ static void vocode_profile_reset() {
     g_vocode_profile.conv_transpose_macs.store(0);
     g_vocode_packed_profile.input_quant_cycles.store(0);
     g_vocode_packed_profile.input_gather_cycles.store(0);
+    g_vocode_packed_profile.reused_input_blocks.store(0);
     g_vocode_packed_profile.input_max_cycles.store(0);
     g_vocode_packed_profile.input_scale_cycles.store(0);
     g_vocode_packed_profile.input_convert_cycles.store(0);
@@ -257,6 +259,7 @@ static void vocode_profile_reset() {
 
 static void vocode_profile_add_packed(
     uint64_t input_gather_cycles,
+    uint64_t reused_input_blocks,
     uint64_t input_quant_cycles,
     uint64_t input_max_cycles,
     uint64_t input_scale_cycles,
@@ -268,6 +271,8 @@ static void vocode_profile_add_packed(
 ) {
     g_vocode_packed_profile.input_gather_cycles.fetch_add(
         input_gather_cycles);
+    g_vocode_packed_profile.reused_input_blocks.fetch_add(
+        reused_input_blocks);
     g_vocode_packed_profile.input_quant_cycles.fetch_add(
         input_quant_cycles);
     g_vocode_packed_profile.input_max_cycles.fetch_add(
@@ -416,6 +421,7 @@ static void vocode_profile_log(uint32_t graph_compute_ms) {
 #if defined(INFLECT_LOW_MEMORY)
     fprintf(stderr,
             "[VocoderPackedProfile] tile=%d input_gather_cycles=%llu "
+            "reused_input_blocks=%llu "
             "input_quant_cycles=%llu "
             "input_max_cycles=%llu input_scale_cycles=%llu "
             "input_convert_cycles=%llu "
@@ -424,6 +430,8 @@ static void vocode_profile_log(uint32_t graph_compute_ms) {
             runtime_packed_quant_time_tile(),
             (unsigned long long)
                 g_vocode_packed_profile.input_gather_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.reused_input_blocks.load(),
             (unsigned long long)
                 g_vocode_packed_profile.input_quant_cycles.load(),
             (unsigned long long)
@@ -542,8 +550,10 @@ static bool is_resblock_conv_label(const char* label) {
 
 #if defined(INFLECT_LOW_MEMORY)
 struct Q4Q8TileDot {
-    int64_t elements = 0;
-    int64_t blocks = 0;
+    int32_t elements = 0;
+    int32_t blocks = 0;
+    bool sparse_input_blocks = false;
+    bool elide_zero_input_values = false;
     VocoderInternalByteScratch input_values;
     VocoderInternalByteScratch input_scales;
     VocoderInternalByteScratch weight_values;
@@ -554,6 +564,7 @@ struct Q4Q8TileDot {
     QuantizeF32ToQ8Blocks32Fn quantize_blocks_32 = nullptr;
 #if INFLECT_PROFILE_VOCODER_OPS
     uint64_t input_gather_cycles = 0;
+    uint64_t reused_input_blocks = 0;
     uint64_t input_quant_cycles = 0;
     uint64_t input_max_cycles = 0;
     uint64_t input_scale_cycles = 0;
@@ -567,18 +578,28 @@ struct Q4Q8TileDot {
     uint64_t profiled_zero_input_values = 0;
 #endif
 
-    bool init(int64_t count, int tile_capacity) {
+    bool init(
+        int64_t count,
+        int tile_capacity,
+        bool sparse_inputs = false
+    ) {
         if (count <= 0 || count % kQ4BlockElements != 0 ||
-            tile_capacity <= 0) {
+            count > INT32_MAX || tile_capacity <= 0) {
             return false;
         }
-        elements = count;
-        blocks = count / kQ4BlockElements;
+        elements = static_cast<int32_t>(count);
+        blocks = elements / kQ4BlockElements;
+        sparse_input_blocks = sparse_inputs;
+        elide_zero_input_values =
+            sparse_inputs &&
+            runtime_has_s8_scaled_dot_blocks_32();
         quantize_blocks_32 =
             runtime_config().quantize_f32_to_q8_blocks_32;
-        return input_values.try_resize(
-                   static_cast<size_t>(elements) *
-                   static_cast<size_t>(tile_capacity)) &&
+        const size_t input_value_bytes =
+            static_cast<size_t>(elements) *
+            static_cast<size_t>(tile_capacity);
+        const bool allocated =
+               input_values.try_resize(input_value_bytes) &&
                input_scales.try_resize(
                    static_cast<size_t>(blocks) *
                    static_cast<size_t>(tile_capacity) *
@@ -599,19 +620,20 @@ struct Q4Q8TileDot {
                     static_cast<size_t>(blocks) *
                     static_cast<size_t>(tile_capacity) *
                     sizeof(int32_t)));
+        return allocated;
     }
 
     __attribute__((always_inline)) inline void quantize_blocks(
         int tile,
-        int64_t first_block,
+        int32_t first_block,
         const float* values,
-        int64_t block_count,
+        int32_t block_count,
         bool skip_zero_blocks
     ) {
 #if INFLECT_PROFILE_VOCODER_OPS
         uint64_t window_zero_values = 0;
         uint64_t window_zero_blocks = 0;
-        for (int64_t block = 0; block < block_count; ++block) {
+        for (int32_t block = 0; block < block_count; ++block) {
             uint64_t block_zero_values = 0;
             for (int index = 0; index < kQ4BlockElements; ++index) {
                 block_zero_values += static_cast<uint64_t>(
@@ -686,8 +708,8 @@ struct Q4Q8TileDot {
 
     __attribute__((always_inline)) inline void store_zero_blocks(
         int tile,
-        int64_t first_block,
-        int64_t block_count
+        int32_t first_block,
+        int32_t block_count
     ) {
         auto* quantized =
             static_cast<int8_t*>(input_values.data()) +
@@ -711,9 +733,14 @@ struct Q4Q8TileDot {
         profiled_zero_input_values += static_cast<uint64_t>(
             block_count * kQ4BlockElements);
 #endif
-        runtime_store_zero_s8_blocks_32(
-            quantized,
-            static_cast<size_t>(block_count));
+        // The sparse scaled-dot kernel checks the scale before touching Q8
+        // values, so a zero block needs only one zero scale store. Keep the
+        // byte write for the portable non-sparse fallback.
+        if (!elide_zero_input_values) {
+            runtime_store_zero_s8_blocks_32(
+                quantized,
+                static_cast<size_t>(block_count));
+        }
         std::fill(
             scales,
             scales + block_count,
@@ -721,6 +748,62 @@ struct Q4Q8TileDot {
 #if INFLECT_PROFILE_VOCODER_OPS
         input_quant_cycles += static_cast<uint32_t>(
             runtime_now_cycles() - started);
+#endif
+    }
+
+    __attribute__((always_inline)) inline void copy_blocks(
+        int destination_tile,
+        int32_t destination_first_block,
+        int source_tile,
+        int32_t source_first_block,
+        int32_t block_count
+#if INFLECT_PROFILE_VOCODER_OPS
+        ,
+        uint64_t source_zero_blocks,
+        uint64_t source_zero_values
+#endif
+    ) {
+        auto* destination_values =
+            static_cast<int8_t*>(input_values.data()) +
+            static_cast<size_t>(destination_tile) *
+                static_cast<size_t>(elements) +
+            static_cast<size_t>(destination_first_block) *
+                kQ4BlockElements;
+        const auto* source_values =
+            static_cast<const int8_t*>(input_values.data()) +
+            static_cast<size_t>(source_tile) *
+                static_cast<size_t>(elements) +
+            static_cast<size_t>(source_first_block) *
+                kQ4BlockElements;
+        auto* destination_scales =
+            static_cast<Q4Q8Scale*>(input_scales.data()) +
+            static_cast<size_t>(destination_tile) *
+                static_cast<size_t>(blocks) +
+            static_cast<size_t>(destination_first_block);
+        const auto* source_scales =
+            static_cast<const Q4Q8Scale*>(input_scales.data()) +
+            static_cast<size_t>(source_tile) *
+                static_cast<size_t>(blocks) +
+            static_cast<size_t>(source_first_block);
+        std::memcpy(
+            destination_values,
+            source_values,
+            static_cast<size_t>(block_count) *
+                kQ4BlockElements);
+        std::memcpy(
+            destination_scales,
+            source_scales,
+            static_cast<size_t>(block_count) *
+                sizeof(Q4Q8Scale));
+#if INFLECT_PROFILE_VOCODER_OPS
+        reused_input_blocks +=
+            static_cast<uint64_t>(block_count);
+        profiled_input_blocks +=
+            static_cast<uint64_t>(block_count);
+        profiled_zero_input_blocks += source_zero_blocks;
+        profiled_input_values += static_cast<uint64_t>(
+            block_count * kQ4BlockElements);
+        profiled_zero_input_values += source_zero_values;
 #endif
     }
 
@@ -742,7 +825,7 @@ struct Q4Q8TileDot {
             values,
             scale_bits,
             static_cast<size_t>(blocks));
-        for (int64_t block = 0; block < blocks; ++block) {
+        for (int32_t block = 0; block < blocks; ++block) {
             scales[block] =
                 cache_weight_scale(scale_bits[block]);
         }
@@ -775,6 +858,7 @@ struct Q4Q8TileDot {
                 static_cast<float*>(results.data()),
                 static_cast<size_t>(blocks),
                 static_cast<size_t>(rows),
+                sparse_input_blocks,
                 dot_cycles_ptr,
                 reduce_cycles_ptr);
 #if INFLECT_PROFILE_VOCODER_OPS
@@ -810,7 +894,7 @@ struct Q4Q8TileDot {
                 weight_scales.data());
         for (int row = 0; row < rows; ++row) {
             float result = 0.0f;
-            for (int64_t block = 0; block < blocks; ++block) {
+            for (int32_t block = 0; block < blocks; ++block) {
                 const size_t index =
                     static_cast<size_t>(row) *
                         static_cast<size_t>(blocks) +
@@ -835,15 +919,44 @@ struct Q4Q8TileDot {
 };
 
 struct Q8HotBlockWriter {
-    Q4Q8TileDot& dot;
-    int tile;
-    float* values;
-    bool skip_zero_blocks;
-    int64_t next_block = 0;
-    int fill = 0;
+    Q4Q8TileDot* dot = nullptr;
+    int tile = 0;
+    float* values = nullptr;
+    bool skip_zero_blocks = false;
+    int32_t next_block = 0;
+    int32_t fill = 0;
+
+    Q8HotBlockWriter() = default;
+
+    Q8HotBlockWriter(
+        Q4Q8TileDot& destination,
+        int destination_tile,
+        float* hot_values,
+        bool skip_zero
+    ) {
+        reset(
+            destination,
+            destination_tile,
+            hot_values,
+            skip_zero);
+    }
+
+    __attribute__((always_inline)) inline void reset(
+        Q4Q8TileDot& destination,
+        int destination_tile,
+        float* hot_values,
+        bool skip_zero
+    ) {
+        dot = &destination;
+        tile = destination_tile;
+        values = hot_values;
+        skip_zero_blocks = skip_zero;
+        next_block = 0;
+        fill = 0;
+    }
 
     __attribute__((always_inline)) inline void flush() {
-        dot.quantize_blocks(
+        dot->quantize_blocks(
             tile,
             next_block,
             values,
@@ -854,12 +967,12 @@ struct Q8HotBlockWriter {
     }
 
     __attribute__((always_inline)) inline void append_zeros(
-        int64_t count
+        int32_t count
     ) {
         if (fill != 0) {
-            const int take = static_cast<int>(
-                std::min<int64_t>(
-                    kQ4BlockElements - fill, count));
+            const int32_t take = std::min<int32_t>(
+                static_cast<int32_t>(kQ4BlockElements) - fill,
+                count);
             std::fill(
                 values + fill,
                 values + fill + take,
@@ -871,9 +984,9 @@ struct Q8HotBlockWriter {
             }
         }
         if (count >= kQ4BlockElements) {
-            const int64_t complete_blocks =
+            const int32_t complete_blocks =
                 count / kQ4BlockElements;
-            dot.store_zero_blocks(
+            dot->store_zero_blocks(
                 tile, next_block, complete_blocks);
             next_block += complete_blocks;
             count -= complete_blocks * kQ4BlockElements;
@@ -883,24 +996,44 @@ struct Q8HotBlockWriter {
                 values,
                 values + count,
                 0.0f);
-            fill = static_cast<int>(count);
+            fill = count;
         }
     }
 
     __attribute__((always_inline)) inline void append_strided(
         const char* source,
         size_t stride,
-        int64_t count
+        int32_t count
     ) {
         while (count > 0) {
-            const int take = static_cast<int>(
-                std::min<int64_t>(
-                    kQ4BlockElements - fill, count));
-            for (int index = 0; index < take; ++index) {
+            const int32_t take = std::min<int32_t>(
+                static_cast<int32_t>(kQ4BlockElements) - fill,
+                count);
+            int32_t index = 0;
+            for (; index + 4 <= take; index += 4) {
                 values[fill + index] =
                     *reinterpret_cast<const float*>(
                         source +
                         static_cast<size_t>(index) * stride);
+                values[fill + index + 1] =
+                    *reinterpret_cast<const float*>(
+                        source +
+                        static_cast<size_t>(index + 1) * stride);
+                values[fill + index + 2] =
+                    *reinterpret_cast<const float*>(
+                        source +
+                        static_cast<size_t>(index + 2) * stride);
+                values[fill + index + 3] =
+                    *reinterpret_cast<const float*>(
+                        source +
+                        static_cast<size_t>(index + 3) * stride);
+            }
+            for (; index < take; ++index) {
+                values[fill + index] =
+                    *reinterpret_cast<const float*>(
+                        source +
+                        static_cast<size_t>(index) *
+                            stride);
             }
             source += static_cast<size_t>(take) * stride;
             fill += take;
@@ -911,9 +1044,82 @@ struct Q8HotBlockWriter {
         }
     }
 
-    __attribute__((always_inline)) inline bool complete() const {
-        return fill == 0 && next_block == dot.blocks;
+    __attribute__((always_inline)) inline void append_contiguous(
+        const float* source,
+        int32_t count
+    ) {
+        while (count > 0) {
+            const int32_t take = std::min<int32_t>(
+                static_cast<int32_t>(kQ4BlockElements) - fill,
+                count);
+            int32_t index = 0;
+            for (; index + 4 <= take; index += 4) {
+                values[fill + index] = source[index];
+                values[fill + index + 1] = source[index + 1];
+                values[fill + index + 2] = source[index + 2];
+                values[fill + index + 3] = source[index + 3];
+            }
+            for (; index < take; ++index) {
+                values[fill + index] = source[index];
+            }
+            source += take;
+            fill += take;
+            count -= take;
+            if (fill == kQ4BlockElements) {
+                flush();
+            }
+        }
     }
+
+    __attribute__((always_inline)) inline int32_t block_position()
+        const {
+        return fill == 0 ? next_block : -1;
+    }
+
+    __attribute__((always_inline)) inline bool append_cached_blocks(
+        int source_tile,
+        int32_t source_first_block,
+        int32_t block_count
+#if INFLECT_PROFILE_VOCODER_OPS
+        ,
+        uint64_t source_zero_blocks,
+        uint64_t source_zero_values
+#endif
+    ) {
+        if (fill != 0 || block_count < 0) {
+            return false;
+        }
+        dot->copy_blocks(
+            tile,
+            next_block,
+            source_tile,
+            source_first_block,
+            block_count
+#if INFLECT_PROFILE_VOCODER_OPS
+            ,
+            source_zero_blocks,
+            source_zero_values
+#endif
+        );
+        next_block += block_count;
+        return true;
+    }
+
+    __attribute__((always_inline)) inline bool complete() const {
+        return dot != nullptr &&
+               fill == 0 &&
+               next_block == dot->blocks;
+    }
+};
+
+struct QuantizedSourceRef {
+#if INFLECT_PROFILE_VOCODER_OPS
+    uint64_t zero_blocks = 0;
+    uint64_t zero_values = 0;
+#endif
+    int32_t first_block = 0;
+    int16_t tile = -1;
+    uint16_t reserved = 0;
 };
 
 struct PackedQuantDot {
@@ -980,9 +1186,11 @@ static bool quant_conv1d_packed_op(
     VocoderInternalFloatScratch input_window;
     VocoderInternalFloatScratch bias_values;
     VocoderInternalByteScratch hot_input_block;
+    VocoderInternalByteScratch channel_span_scratch;
     VocoderInternalByteScratch quantized_windows;
     VocoderInternalByteScratch weight_row;
     std::unique_ptr<Q4Q8TileDot> q4_dot;
+    std::unique_ptr<Q8HotBlockWriter[]> tile_writers;
     const int time_tile = runtime_packed_quant_time_tile();
     const bool use_q4_dot =
         weight->type == GGML_TYPE_Q4_0 &&
@@ -991,15 +1199,27 @@ static bool quant_conv1d_packed_op(
         ggml_row_size(weight->type, packed.elements);
     if (use_q4_dot) {
         q4_dot.reset(new (std::nothrow) Q4Q8TileDot());
+        tile_writers.reset(
+            new (std::nothrow) Q8HotBlockWriter[time_tile]);
     } else {
         input_window.resize(static_cast<size_t>(packed.elements));
     }
+    const int64_t maximum_channel_span =
+        static_cast<int64_t>(time_tile - 1) * p->stride +
+        static_cast<int64_t>(p->kernel_size - 1) *
+            p->dilation +
+        1;
     if (use_q4_dot
             ? (q4_dot == nullptr ||
+               tile_writers == nullptr ||
                !q4_dot->init(
                    packed.elements, time_tile) ||
                !hot_input_block.try_resize(
-                   kQ4BlockElements * sizeof(float)))
+                   static_cast<size_t>(time_tile) *
+                   kQ4BlockElements * sizeof(float)) ||
+               !channel_span_scratch.try_resize(
+                   static_cast<size_t>(maximum_channel_span) *
+                   sizeof(float)))
             : (!quantized_windows.try_resize(
                    packed.input_bytes *
                        static_cast<size_t>(time_tile)) ||
@@ -1044,84 +1264,233 @@ static bool quant_conv1d_packed_op(
             const int tile_count = static_cast<int>(
                 std::min<int64_t>(
                     time_tile, time_end - tile_start));
-            for (int tile = 0; tile < tile_count; ++tile) {
-                const int64_t t = tile_start + tile;
-                if (use_q4_dot) {
+            if (use_q4_dot) {
 #if INFLECT_PROFILE_VOCODER_OPS
-                    const uint64_t quant_cycles_before =
-                        q4_dot->input_quant_cycles;
-                    const uint32_t gather_started =
-                        runtime_now_cycles();
+                const uint64_t quant_cycles_before =
+                    q4_dot->input_quant_cycles;
+                const uint32_t gather_started =
+                    runtime_now_cycles();
 #endif
-                    Q8HotBlockWriter writer{
-                        *q4_dot, tile, window, false};
-                    const int64_t first_source_t =
-                        t * p->stride - p->padding;
-                    const int valid_begin =
-                        first_source_t >= 0
-                            ? 0
-                            : static_cast<int>(
-                                  (-first_source_t +
-                                   p->dilation - 1) /
-                                  p->dilation);
-                    const int valid_end =
-                        first_source_t >= x->ne[0]
-                            ? 0
-                            : static_cast<int>(
-                                  (x->ne[0] - 1 -
-                                   first_source_t) /
-                                      p->dilation +
-                                  1);
-                    const int begin = std::max(
-                        0,
-                        std::min(
-                            p->kernel_size, valid_begin));
-                    const int end = std::max(
-                        begin,
-                        std::min(
-                            p->kernel_size, valid_end));
-                    for (int64_t channel = 0;
+                // Neighboring Conv1D windows overlap heavily. Stage each
+                // channel's full temporal span once, then assemble every
+                // window in the tile from internal memory. This changes the
+                // expensive source reads from tile_count * kernel_size to
+                // only the union of their source positions.
+                const int64_t first_source_t =
+                    tile_start * p->stride - p->padding;
+                const int64_t channel_span_count =
+                    static_cast<int64_t>(tile_count - 1) *
+                        p->stride +
+                    static_cast<int64_t>(p->kernel_size - 1) *
+                        p->dilation +
+                    1;
+                const bool stage_channel_span =
+                    channel_span_count <
+                    static_cast<int64_t>(tile_count) *
+                        p->kernel_size;
+                if (stage_channel_span) {
+                    for (int tile = 0;
+                         tile < tile_count;
+                         ++tile) {
+                        tile_writers[tile].reset(
+                            *q4_dot,
+                            tile,
+                            window +
+                                static_cast<size_t>(tile) *
+                                    kQ4BlockElements,
+                            false);
+                    }
+                    auto* channel_span =
+                        static_cast<float*>(
+                            channel_span_scratch.data());
+                    const int64_t valid_span_begin =
+                        std::min<int64_t>(
+                            channel_span_count,
+                            std::max<int64_t>(
+                                0, -first_source_t));
+                    const int64_t valid_span_end =
+                        std::max(
+                            valid_span_begin,
+                            std::min<int64_t>(
+                                channel_span_count,
+                                x->ne[0] - first_source_t));
+                    std::fill(
+                        channel_span,
+                        channel_span + valid_span_begin,
+                        0.0f);
+                    std::fill(
+                        channel_span + valid_span_end,
+                        channel_span + channel_span_count,
+                        0.0f);
+                    const int64_t valid_count =
+                        valid_span_end - valid_span_begin;
+                    const char* channel_source =
+                        valid_count > 0
+                            ? x_data +
+                                  (first_source_t +
+                                   valid_span_begin) *
+                                      x->nb[0] +
+                                  b * x->nb[2]
+                            : nullptr;
+                    for (int32_t channel = 0;
                          channel < in_ch;
                          ++channel) {
-                        writer.append_zeros(begin);
-                        if (end > begin) {
-                            const int64_t source_t =
-                                first_source_t +
-                                static_cast<int64_t>(begin) *
-                                    p->dilation;
-                            writer.append_strided(
-                                x_data +
-                                    source_t * x->nb[0] +
-                                    channel * x->nb[1] +
-                                    b * x->nb[2],
-                                static_cast<size_t>(
-                                    p->dilation) *
-                                    x->nb[0],
-                                end - begin);
+                        if (valid_count > 0) {
+                            if (x->nb[0] == sizeof(float)) {
+                                std::memcpy(
+                                    channel_span +
+                                        valid_span_begin,
+                                    channel_source,
+                                    static_cast<size_t>(
+                                        valid_count) *
+                                        sizeof(float));
+                            } else {
+                                for (int64_t index = 0;
+                                     index < valid_count;
+                                     ++index) {
+                                    channel_span[
+                                        valid_span_begin +
+                                        index] =
+                                        *reinterpret_cast<
+                                            const float*>(
+                                                channel_source +
+                                                static_cast<size_t>(
+                                                    index) *
+                                                    x->nb[0]);
+                                }
+                            }
+                            channel_source += x->nb[1];
+                        }
+                        for (int tile = 0;
+                             tile < tile_count;
+                             ++tile) {
+                            const float* tile_source =
+                                channel_span +
+                                static_cast<int64_t>(tile) *
+                                    p->stride;
+                            if (p->dilation == 1) {
+                                tile_writers[tile].
+                                    append_contiguous(
+                                        tile_source,
+                                        p->kernel_size);
+                            } else {
+                                tile_writers[tile].
+                                    append_strided(
+                                        reinterpret_cast<
+                                            const char*>(
+                                                tile_source),
+                                        static_cast<size_t>(
+                                            p->dilation) *
+                                            sizeof(float),
+                                        p->kernel_size);
+                            }
+                        }
+                    }
+                    for (int tile = 0;
+                         tile < tile_count;
+                         ++tile) {
+                        tile_writers[tile].append_zeros(
+                            static_cast<int32_t>(
+                                packed.elements - flat));
+                        if (!tile_writers[tile].complete()) {
+                            return false;
+                        }
+                    }
+                } else {
+                    for (int tile = 0;
+                         tile < tile_count;
+                         ++tile) {
+                        const int64_t tile_first_source_t =
+                            (tile_start + tile) * p->stride -
+                            p->padding;
+                        const int valid_begin =
+                            tile_first_source_t >= 0
+                                ? 0
+                                : static_cast<int>(
+                                      (-tile_first_source_t +
+                                       p->dilation - 1) /
+                                      p->dilation);
+                        const int valid_end =
+                            tile_first_source_t >= x->ne[0]
+                                ? 0
+                                : static_cast<int>(
+                                      (x->ne[0] - 1 -
+                                       tile_first_source_t) /
+                                          p->dilation +
+                                      1);
+                        const int begin = std::max(
+                            0,
+                            std::min(
+                                p->kernel_size,
+                                valid_begin));
+                        const int end = std::max(
+                            begin,
+                            std::min(
+                                p->kernel_size,
+                                valid_end));
+                        Q8HotBlockWriter writer{
+                            *q4_dot, tile, window, false};
+                        const int64_t source_t =
+                            tile_first_source_t +
+                            static_cast<int64_t>(begin) *
+                                p->dilation;
+                        const char* channel_source =
+                            end > begin
+                                ? x_data +
+                                      source_t * x->nb[0] +
+                                      b * x->nb[2]
+                                : nullptr;
+                        for (int32_t channel = 0;
+                             channel < in_ch;
+                             ++channel) {
+                            writer.append_zeros(begin);
+                            if (end > begin) {
+                                if (p->dilation == 1 &&
+                                    x->nb[0] ==
+                                        sizeof(float)) {
+                                    writer.append_contiguous(
+                                        reinterpret_cast<
+                                            const float*>(
+                                                channel_source),
+                                        end - begin);
+                                } else {
+                                    writer.append_strided(
+                                        channel_source,
+                                        static_cast<size_t>(
+                                            p->dilation) *
+                                            x->nb[0],
+                                        end - begin);
+                                }
+                                channel_source += x->nb[1];
+                            }
+                            writer.append_zeros(
+                                p->kernel_size - end);
                         }
                         writer.append_zeros(
-                            p->kernel_size - end);
+                            static_cast<int32_t>(
+                                packed.elements - flat));
+                        if (!writer.complete()) {
+                            return false;
+                        }
                     }
-                    writer.append_zeros(
-                        packed.elements - flat);
-                    if (!writer.complete()) {
-                        return false;
-                    }
+                }
 #if INFLECT_PROFILE_VOCODER_OPS
-                    const uint32_t gather_finished =
-                        runtime_now_cycles();
-                    const uint64_t quant_cycles =
-                        q4_dot->input_quant_cycles -
-                        quant_cycles_before;
-                    const uint64_t window_cycles =
-                        static_cast<uint32_t>(
-                            gather_finished - gather_started);
-                    q4_dot->input_gather_cycles +=
-                        window_cycles > quant_cycles
-                            ? window_cycles - quant_cycles
-                            : 0;
+                const uint32_t gather_finished =
+                    runtime_now_cycles();
+                const uint64_t quant_cycles =
+                    q4_dot->input_quant_cycles -
+                    quant_cycles_before;
+                const uint64_t window_cycles =
+                    static_cast<uint32_t>(
+                        gather_finished - gather_started);
+                q4_dot->input_gather_cycles +=
+                    window_cycles > quant_cycles
+                        ? window_cycles - quant_cycles
+                        : 0;
 #endif
-                } else {
+            } else {
+                for (int tile = 0; tile < tile_count; ++tile) {
+                    const int64_t t = tile_start + tile;
                     for (int64_t c = 0; c < in_ch; ++c) {
                         float* dst_c =
                             window + c * p->kernel_size;
@@ -1235,6 +1604,7 @@ static bool quant_conv1d_packed_op(
     if (use_q4_dot) {
         vocode_profile_add_packed(
             q4_dot->input_gather_cycles,
+            q4_dot->reused_input_blocks,
             q4_dot->input_quant_cycles,
             q4_dot->input_max_cycles,
             q4_dot->input_scale_cycles,
@@ -1671,6 +2041,7 @@ static bool quant_conv_transpose1d_packed_op(
 
     VocoderInternalFloatScratch input_window;
     VocoderInternalByteScratch hot_input_block;
+    VocoderInternalByteScratch source_cache_scratch;
     VocoderInternalByteScratch quantized_windows;
     VocoderInternalByteScratch weight_row;
     std::unique_ptr<Q4Q8TileDot> q4_dot;
@@ -1678,6 +2049,11 @@ static bool quant_conv_transpose1d_packed_op(
     const bool use_q4_dot =
         weight->type == GGML_TYPE_Q4_0 &&
         runtime_has_s8_dot_blocks_32();
+    const bool reuse_aligned_sources =
+        use_q4_dot &&
+        in_ch % kQ4BlockElements == 0;
+    const int source_cache_capacity =
+        time_tile + p->kernel_size + 1;
     const size_t weight_row_bytes =
         ggml_row_size(weight->type, packed.elements);
     if (use_q4_dot) {
@@ -1688,9 +2064,14 @@ static bool quant_conv_transpose1d_packed_op(
     if (use_q4_dot
             ? (q4_dot == nullptr ||
                !q4_dot->init(
-                   packed.elements, time_tile) ||
+                   packed.elements, time_tile, true) ||
                !hot_input_block.try_resize(
-                   kQ4BlockElements * sizeof(float)))
+                   kQ4BlockElements * sizeof(float)) ||
+               (reuse_aligned_sources &&
+                !source_cache_scratch.try_resize(
+                    static_cast<size_t>(
+                        source_cache_capacity) *
+                    sizeof(QuantizedSourceRef))))
             : (!quantized_windows.try_resize(
                    packed.input_bytes *
                        static_cast<size_t>(time_tile)) ||
@@ -1725,6 +2106,43 @@ static bool quant_conv_transpose1d_packed_op(
             const int tile_count = static_cast<int>(
                 std::min<int64_t>(
                     time_tile, time_end - tile_start));
+            QuantizedSourceRef* source_cache = nullptr;
+            int64_t source_cache_first = 0;
+            int64_t source_cache_count = 0;
+            if (reuse_aligned_sources) {
+                const int64_t first_full_t =
+                    tile_start + p->crop_left;
+                const int64_t last_full_t =
+                    tile_start + tile_count - 1 +
+                    p->crop_left;
+                source_cache_first =
+                    first_full_t >= p->kernel_size - 1
+                        ? (first_full_t -
+                           (p->kernel_size - 1)) /
+                              p->stride
+                        : 0;
+                const int64_t source_cache_last =
+                    std::min<int64_t>(
+                        in_t - 1,
+                        last_full_t / p->stride);
+                source_cache_count =
+                    std::max<int64_t>(
+                        0,
+                        source_cache_last -
+                            source_cache_first +
+                            1);
+                if (source_cache_count >
+                    source_cache_capacity) {
+                    return false;
+                }
+                source_cache =
+                    static_cast<QuantizedSourceRef*>(
+                        source_cache_scratch.data());
+                std::fill(
+                    source_cache,
+                    source_cache + source_cache_count,
+                    QuantizedSourceRef{});
+            }
             for (int tile = 0; tile < tile_count; ++tile) {
                 const int64_t t = tile_start + tile;
                 const int64_t full_t =
@@ -1738,30 +2156,97 @@ static bool quant_conv_transpose1d_packed_op(
 #endif
                     Q8HotBlockWriter writer{
                         *q4_dot, tile, window, true};
-                    for (int kernel = 0;
+                    // Only one kernel phase can map to an input sample.
+                    // Enumerate those taps directly and emit each run of
+                    // structurally zero taps in a single writer call.
+                    const int first_kernel =
+                        static_cast<int>(
+                            full_t % p->stride);
+                    int next_kernel = 0;
+                    int64_t source_t =
+                        (full_t - first_kernel) / p->stride;
+                    for (int kernel = first_kernel;
                          kernel < p->kernel_size;
-                         ++kernel) {
-                        const int64_t source_numerator =
-                            full_t - kernel;
-                        const bool tap_aligned =
-                            source_numerator >= 0 &&
-                            source_numerator % p->stride == 0;
-                        const int64_t source_t =
-                            tap_aligned
-                                ? source_numerator / p->stride
-                                : -1;
+                         kernel += p->stride, --source_t) {
+                        writer.append_zeros(
+                            static_cast<int32_t>(
+                                kernel - next_kernel) *
+                            static_cast<int32_t>(in_ch));
                         if (source_t >= 0 &&
                             source_t < in_t) {
-                            writer.append_strided(
-                                x_data +
-                                    source_t * x->nb[0] +
-                                    b * x->nb[2],
-                                x->nb[1],
-                                in_ch);
+                            QuantizedSourceRef* cached = nullptr;
+                            if (reuse_aligned_sources) {
+                                const int64_t cache_index =
+                                    source_t -
+                                    source_cache_first;
+                                if (cache_index < 0 ||
+                                    cache_index >=
+                                        source_cache_count) {
+                                    return false;
+                                }
+                                cached =
+                                    source_cache + cache_index;
+                            }
+                            if (cached != nullptr &&
+                                cached->tile >= 0) {
+                                if (!writer.append_cached_blocks(
+                                        cached->tile,
+                                        cached->first_block,
+                                        in_ch /
+                                            kQ4BlockElements
+#if INFLECT_PROFILE_VOCODER_OPS
+                                        ,
+                                        cached->zero_blocks,
+                                        cached->zero_values
+#endif
+                                    )) {
+                                    return false;
+                                }
+                            } else {
+                                const int64_t first_block =
+                                    writer.block_position();
+                                if (first_block < 0) {
+                                    return false;
+                                }
+#if INFLECT_PROFILE_VOCODER_OPS
+                                const uint64_t zero_blocks_before =
+                                    q4_dot->
+                                        profiled_zero_input_blocks;
+                                const uint64_t zero_values_before =
+                                    q4_dot->
+                                        profiled_zero_input_values;
+#endif
+                                writer.append_strided(
+                                    x_data +
+                                        source_t * x->nb[0] +
+                                        b * x->nb[2],
+                                    x->nb[1],
+                                    in_ch);
+                                if (cached != nullptr) {
+                                    cached->tile = tile;
+                                    cached->first_block =
+                                        first_block;
+#if INFLECT_PROFILE_VOCODER_OPS
+                                    cached->zero_blocks =
+                                        q4_dot->
+                                            profiled_zero_input_blocks -
+                                        zero_blocks_before;
+                                    cached->zero_values =
+                                        q4_dot->
+                                            profiled_zero_input_values -
+                                        zero_values_before;
+#endif
+                                }
+                            }
                         } else {
                             writer.append_zeros(in_ch);
                         }
+                        next_kernel = kernel + 1;
                     }
+                    writer.append_zeros(
+                        static_cast<int32_t>(
+                            p->kernel_size - next_kernel) *
+                        static_cast<int32_t>(in_ch));
                     writer.append_zeros(
                         packed.elements - flat);
                     if (!writer.complete()) {
@@ -1890,6 +2375,7 @@ static bool quant_conv_transpose1d_packed_op(
     if (use_q4_dot) {
         vocode_profile_add_packed(
             q4_dot->input_gather_cycles,
+            q4_dot->reused_input_blocks,
             q4_dot->input_quant_cycles,
             q4_dot->input_max_cycles,
             q4_dot->input_scale_cycles,
@@ -3014,7 +3500,7 @@ bool VocoderModel::vocode_staged(
     }
     std::vector<float> current =
         run_pre_stage(mel, n_mels, n_frames, backend);
-    loader.reset();
+    loader->release_selected();
     mem_release_to_os();
     runtime_trace_heap("v2 staged pre released");
     if (current.empty()) {
@@ -3035,15 +3521,14 @@ bool VocoderModel::vocode_staged(
                 root + "resblocks." +
                 std::to_string(stage * n_res + branch) + ".");
         }
-        loader = std::make_unique<ModelLoader>();
-        if (!loader->load_selected(model_path, prefixes) ||
+        if (!loader->select(prefixes) ||
             !load_upsample_stage(*loader, stage)) {
             return false;
         }
         std::vector<float> next =
             run_upsample_stage(
                 current, current_frames, stage, backend);
-        loader.reset();
+        loader->release_selected();
         mem_release_to_os();
         runtime_trace_heap(
             ("v2 staged upsample " +
@@ -3056,15 +3541,13 @@ bool VocoderModel::vocode_staged(
         current_frames *= config_.upsample_rates[stage];
     }
 
-    loader = std::make_unique<ModelLoader>();
-    if (!loader->load_selected(
-            model_path, {root + "conv_post."}) ||
+    if (!loader->select({root + "conv_post."}) ||
         !load_post_stage(*loader)) {
         return false;
     }
     std::vector<float> audio =
         run_post_stage(current, current_frames, backend);
-    loader.reset();
+    loader->release_selected();
     mem_release_to_os();
     runtime_trace_heap("v2 staged post released");
     if (audio.empty()) {
@@ -3155,7 +3638,11 @@ std::vector<float> VocoderModel::vocode(
     ggml_status status = ggml_backend_graph_compute(backend, graph);
     const uint32_t compute_elapsed_ms = now_ms() - stage_ms;
     if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "[VocoderModel] Graph computation failed\n");
+        fprintf(stderr, "[VocoderModel] Graph computation stopped: %s\n",
+                ggml_status_to_string(status));
+        ggml_gallocr_free(allocr);
+        ggml_free(gctx);
+        return {};
     }
     mem_trace_rss("vocoder computed");
     mem_trace_heap("vocoder computed");
@@ -3292,6 +3779,9 @@ void VocoderModel::vocode_streaming(
             callback(audio.data(), audio.size());
             return;
         }
+        if (runtime_cancelled()) {
+            return;
+        }
         fprintf(
             stderr,
             "[VocoderModel] full short utterance did not fit; "
@@ -3327,6 +3817,9 @@ void VocoderModel::vocode_streaming(
 
         int chunk_index = 0;
         for (int start = 0; start < n_frames; start += hop) {
+            if (runtime_cancelled()) {
+                return;
+            }
             const uint32_t chunk_start_ms = now_ms();
             const int end = std::min(start + chunk_frames, n_frames);
             const int chunk_len = end - start;
@@ -3344,6 +3837,9 @@ void VocoderModel::vocode_streaming(
 
             audio_chunk = vocode(
                 mel_chunk, n_mels, chunk_len, backend);
+            if (runtime_cancelled()) {
+                return;
+            }
             const int discard_start =
                 start > 0 ? overlap * upsample / 2 : 0;
             const int discard_end =
@@ -3441,6 +3937,9 @@ void VocoderModel::vocode_streaming(
             mel_chunk, n_mels, input_frames, backend);
 #if defined(INFLECT_LOW_MEMORY)
         if (audio_chunk.empty()) {
+            if (runtime_cancelled()) {
+                return;
+            }
             if (chunk_frames <= 1) {
                 std::fprintf(
                     stderr,

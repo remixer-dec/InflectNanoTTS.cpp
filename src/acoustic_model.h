@@ -96,6 +96,11 @@ struct QuantConv1dOpData {
     int dilation;
 };
 
+struct QuantLinearOpData {
+    int input_elements;
+    bool has_bias;
+};
+
 // ─────────────────────────────────────────────────────────────────────────
 // Intermediate results
 // ─────────────────────────────────────────────────────────────────────────
@@ -161,6 +166,7 @@ private:
     AcousticConfig config_;
     AcousticWeights weights_;
     ggml_context* wctx_ = nullptr;  // holds weight tensor metadata
+    std::vector<QuantLinearOpData> quant_linear_ops_;
     std::vector<QuantConv1dOpData> quant_conv1d_ops_;
 
     // ── Graph builders ─────────────────────────────────────────────

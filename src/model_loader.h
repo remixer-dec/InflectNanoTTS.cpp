@@ -4,6 +4,7 @@
 #include "../ggml/include/ggml-backend.h"
 #include "../ggml/include/ggml-alloc.h"
 #include "../ggml/include/gguf.h"
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,9 @@ public:
     // Load GGUF file, allocate backend buffer for weights
     bool load(const std::string& path);
     bool load_selected(const std::string& path, const std::vector<std::string>& prefixes);
+    bool open(const std::string& path);
+    bool select(const std::vector<std::string>& prefixes);
+    void release_selected();
 
     // ── Tensor access ──────────────────────────────────────────────
     ggml_tensor* get_tensor(const std::string& name) const;
@@ -40,9 +44,14 @@ public:
     size_t n_tensors() const;
 
 private:
+    void release_weights();
+
     gguf_context*         gguf_   = nullptr;
     ggml_context*         ctx_    = nullptr;
     ggml_backend_buffer_t buffer_ = nullptr;
+    std::FILE*            file_   = nullptr;
+    std::string           path_;
+    std::vector<ggml_tensor*> selected_tensors_;
 };
 
 } // namespace inflect

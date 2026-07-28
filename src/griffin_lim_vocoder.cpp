@@ -7,22 +7,11 @@
 #include <cstdio>
 #include <vector>
 
-#if __has_include(<esp_dsp.h>)
-#include <esp_dsp.h>
-#define INFLECT_GL_HAS_ESP_DSP 1
-#else
-#define INFLECT_GL_HAS_ESP_DSP 0
-#endif
-
 namespace inflect {
 namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr int kFftGuardFloats = 16;
-
-#ifndef INFLECT_GRIFFIN_LIM_USE_ESP_DSP
-#define INFLECT_GRIFFIN_LIM_USE_ESP_DSP 0
-#endif
 
 struct FloatStats {
     float min = 0.0f;
@@ -33,6 +22,13 @@ struct FloatStats {
 };
 
 static uint32_t now_ms() { return runtime_now_ms(); }
+
+static bool cooperate_or_cancel() {
+#if defined(INFLECT_LOW_MEMORY)
+    runtime_cooperate();
+#endif
+    return runtime_cancelled();
+}
 
 static float hz_to_mel(float hz) {
     return 2595.0f * std::log10(1.0f + hz / 700.0f);
@@ -132,7 +128,11 @@ static bool fft_radix2_inplace(std::vector<float>& data, int n_fft) {
     return true;
 }
 
-static bool fft_inplace(std::vector<float>& data, int n_fft, bool inverse, bool use_esp_dsp) {
+static bool fft_inplace(
+    std::vector<float>& data,
+    int n_fft,
+    bool inverse
+) {
     const int active_floats = 2 * n_fft;
     if ((int)data.size() < active_floats) {
         return false;
@@ -147,20 +147,8 @@ static bool fft_inplace(std::vector<float>& data, int n_fft, bool inverse, bool 
         }
     }
 
-#if INFLECT_GL_HAS_ESP_DSP && INFLECT_GRIFFIN_LIM_USE_ESP_DSP
-    if (use_esp_dsp) {
-        if (dsps_fft2r_fc32(data.data(), n_fft) == ESP_OK) {
-            dsps_bit_rev_fc32(data.data(), n_fft);
-        } else {
-            use_esp_dsp = false;
-        }
-    }
-#endif
-
-    if (!use_esp_dsp) {
-        if (!fft_radix2_inplace(data, n_fft)) {
-            return false;
-        }
+    if (!fft_radix2_inplace(data, n_fft)) {
+        return false;
     }
 
     if (inverse) {
@@ -247,10 +235,12 @@ static void mel_to_linear_magnitude(
             for (int m = 0; m < n_mels; m++) {
                 const float w = filterbank[m * n_bins + k];
                 if (w > 0.0f) {
-                    sum += w * mel_value_to_magnitude(mel[m + n_mels * t]);
+                    sum += w * mel_value_to_magnitude(
+                        mel[m + n_mels * t]);
                 }
             }
-            target_mag[t * n_bins + k] = sum / bin_weight_sum[k];
+            target_mag[t * n_bins + k] =
+                sum / bin_weight_sum[k];
         }
     }
 }
@@ -282,7 +272,6 @@ static void istft_from_phase(
     int n_frames,
     const GriffinLimConfig& config,
     const std::vector<float>& window,
-    bool use_esp_dsp,
     std::vector<float>& audio
 ) {
     const int n_fft = config.n_fft;
@@ -293,7 +282,8 @@ static void istft_from_phase(
 
     audio.assign(internal_len, 0.0f);
     std::vector<float> window_norm(internal_len, 0.0f);
-    std::vector<float> spectrum(2 * n_fft + kFftGuardFloats, 0.0f);
+    std::vector<float> spectrum(
+        2 * n_fft + kFftGuardFloats, 0.0f);
 
     for (int t = 0; t < n_frames; t++) {
         spectrum_from_mag_phase(
@@ -302,7 +292,7 @@ static void istft_from_phase(
             n_bins,
             n_fft,
             spectrum);
-        fft_inplace(spectrum, n_fft, true, use_esp_dsp);
+        fft_inplace(spectrum, n_fft, true);
 
         const int offset = t * hop;
         for (int i = 0; i < n_fft && offset + i < internal_len; i++) {
@@ -327,14 +317,13 @@ static void update_phase_from_audio(
     int n_frames,
     const GriffinLimConfig& config,
     const std::vector<float>& window,
-    bool use_esp_dsp,
     std::vector<float>& phase
 ) {
     const int n_fft = config.n_fft;
     const int n_bins = n_fft / 2 + 1;
     const int hop = config.hop_length;
-    std::vector<float> spectrum(2 * n_fft + kFftGuardFloats, 0.0f);
-
+    std::vector<float> spectrum(
+        2 * n_fft + kFftGuardFloats, 0.0f);
     for (int t = 0; t < n_frames; t++) {
         std::fill(spectrum.begin(), spectrum.end(), 0.0f);
         const int offset = t * hop;
@@ -343,9 +332,11 @@ static void update_phase_from_audio(
             spectrum[2 * i] = (idx >= 0 && idx < (int)audio.size()) ? audio[idx] * window[i] : 0.0f;
         }
 
-        fft_inplace(spectrum, n_fft, false, use_esp_dsp);
+        fft_inplace(spectrum, n_fft, false);
         for (int k = 0; k < n_bins; k++) {
-            phase[t * n_bins + k] = std::atan2(spectrum[2 * k + 1], spectrum[2 * k]);
+            const float real = spectrum[2 * k];
+            const float imag = spectrum[2 * k + 1];
+            phase[t * n_bins + k] = std::atan2(imag, real);
         }
     }
 }
@@ -418,31 +409,29 @@ std::vector<float> griffin_lim_vocode(
     uint32_t stage_ms = start_ms;
     const int n_bins = config.n_fft / 2 + 1;
 
-#if INFLECT_GL_HAS_ESP_DSP && INFLECT_GRIFFIN_LIM_USE_ESP_DSP
-    const bool use_esp_dsp = config.use_esp_dsp_fft &&
-                             dsps_fft2r_init_fc32(nullptr, config.n_fft) == ESP_OK;
-#else
-    const bool use_esp_dsp = false;
-#endif
-
     fprintf(stderr,
-            "[GriffinLim] begin frames=%d mels=%d samples_est=%d fft=%d hop=%d iters=%d esp_dsp=%d\n",
+            "[GriffinLim] begin frames=%d mels=%d samples_est=%d fft=%d hop=%d iters=%d\n",
             n_frames,
             n_mels,
             n_frames * config.hop_length,
             config.n_fft,
             config.hop_length,
-            config.iterations,
-            use_esp_dsp ? 1 : 0);
+            config.iterations);
 
     std::vector<float> filterbank;
     std::vector<float> bin_weight_sum;
-    make_mel_filterbank(n_mels, n_bins, config.sample_rate, config.n_fft,
-                        config.f_min, config.f_max, filterbank, bin_weight_sum);
+    make_mel_filterbank(
+        n_mels, n_bins, config.sample_rate, config.n_fft,
+        config.f_min, config.f_max,
+        filterbank, bin_weight_sum);
 
     std::vector<float> target_mag;
     mel_to_linear_magnitude(mel, n_mels, n_frames, n_bins,
-                            filterbank, bin_weight_sum, target_mag);
+                            filterbank, bin_weight_sum,
+                            target_mag);
+    if (runtime_cancelled()) {
+        return {};
+    }
     log_stats("mel stats", mel);
     log_stats("magnitude stats", target_mag);
 
@@ -462,10 +451,23 @@ std::vector<float> griffin_lim_vocode(
     const std::vector<float> window = make_hann_window(config.n_fft, config.win_length);
     std::vector<float> audio;
     for (int iter = 0; iter < config.iterations; iter++) {
+        if (cooperate_or_cancel()) {
+            return {};
+        }
         const uint32_t iter_ms = now_ms();
-        istft_from_phase(target_mag, phase, n_frames, config, window, use_esp_dsp, audio);
+        istft_from_phase(
+            target_mag, phase, n_frames, config,
+            window, audio);
+        if (runtime_cancelled()) {
+            return {};
+        }
         const uint32_t istft_ms = now_ms() - iter_ms;
-        update_phase_from_audio(audio, n_frames, config, window, use_esp_dsp, phase);
+        update_phase_from_audio(
+            audio, n_frames, config, window,
+            phase);
+        if (runtime_cancelled()) {
+            return {};
+        }
         fprintf(stderr,
                 "[GriffinLim] iter=%d/%d istft_ms=%u stft_ms=%u total_ms=%u\n",
                 iter + 1,
@@ -475,7 +477,12 @@ std::vector<float> griffin_lim_vocode(
                 (unsigned)(now_ms() - start_ms));
     }
 
-    istft_from_phase(target_mag, phase, n_frames, config, window, use_esp_dsp, audio);
+    istft_from_phase(
+        target_mag, phase, n_frames, config,
+        window, audio);
+    if (runtime_cancelled()) {
+        return {};
+    }
     log_stats("raw audio stats", audio);
     normalize_audio(audio, config);
     fprintf(stderr,

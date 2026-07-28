@@ -17,7 +17,6 @@ struct GriffinLimConfig {
     float f_max = 12000.0f;
     float output_peak = 0.35f;
     float max_output_gain = 8192.0f;
-    bool use_esp_dsp_fft = false;
     uint64_t seed = 1234;
 };
 

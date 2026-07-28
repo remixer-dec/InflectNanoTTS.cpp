@@ -14,6 +14,9 @@ set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_METAL OFF CACHE BOOL "" FORCE)
 set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
 option(INFLECT_LOW_MEMORY "Enable compile-time low-memory defaults for edge devices" OFF)
+option(INFLECT_PROFILE_ACOUSTIC_OPS
+       "Enable profiling-only acoustic operator instrumentation"
+       OFF)
 option(INFLECT_V2_ESPEAK_FALLBACK
        "Enable CPU-only eSpeak-ng fallback for V2 words missing from IVL2"
        OFF)
@@ -69,6 +72,11 @@ endforeach()
 
 if(INFLECT_V2_ESPEAK_FALLBACK)
     target_compile_definitions(inflect-nano PRIVATE INFLECT_V2_ESPEAK_FALLBACK)
+endif()
+
+if(INFLECT_PROFILE_ACOUSTIC_OPS)
+    target_compile_definitions(
+        inflect-nano PRIVATE INFLECT_PROFILE_ACOUSTIC_OPS=1)
 endif()
 
 if(BUILD_TESTING)

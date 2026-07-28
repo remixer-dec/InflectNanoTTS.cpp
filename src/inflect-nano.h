@@ -39,6 +39,8 @@ struct RuntimeConfig {
     void* (*scratch_alloc)(size_t bytes, ScratchMemoryKind kind) = nullptr;
     void (*scratch_free)(void* ptr) = nullptr;
     void (*trace_heap)(const char* label) = nullptr;
+    bool (*cancelled)(void* user) = nullptr;
+    void* cancellation_user = nullptr;
 #if defined(INFLECT_LOW_MEMORY)
     void (*cooperate)() = nullptr;
     void (*dot_s8_blocks_32)(
@@ -55,6 +57,7 @@ struct RuntimeConfig {
         float* results,
         size_t blocks,
         size_t rows,
+        bool skip_zero_scale_blocks,
         uint64_t* dot_cycles,
         uint64_t* scale_cycles) = nullptr;
     void (*unpack_q4_0_blocks_32)(
@@ -81,6 +84,7 @@ uint32_t runtime_now_cycles();
 void* runtime_alloc_scratch(size_t bytes, ScratchMemoryKind kind);
 void runtime_free_scratch(void* ptr);
 void runtime_trace_heap(const char* label);
+bool runtime_cancelled();
 #if defined(INFLECT_LOW_MEMORY)
 void runtime_cooperate();
 void runtime_dot_s8_blocks_32(
@@ -97,6 +101,7 @@ void runtime_dot_s8_scaled_blocks_32(
     float* results,
     size_t blocks,
     size_t rows,
+    bool skip_zero_scale_blocks,
     uint64_t* dot_cycles,
     uint64_t* scale_cycles);
 bool runtime_has_s8_dot_blocks_32();

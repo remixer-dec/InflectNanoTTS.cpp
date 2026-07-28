@@ -107,6 +107,20 @@ inline int round_half_away_from_zero_bits_bounded(float value) {
            sign_mask;
 }
 
+// Exact for finite IEEE-754 binary32 values in the Q8 conversion range
+// [-127, 127]. The guard prevents a value immediately below 0.5 from
+// rounding up during the addition. Above that boundary, adding a
+// sign-matched 0.5 and truncating implements half-away-from-zero.
+inline int round_half_away_from_zero_add_bounded(float value) {
+    const uint32_t bits = float_bits(value);
+    if ((bits & 0x7fffffffU) < 0x3f000000U) {
+        return 0;
+    }
+    const float signed_half = float_from_bits(
+        (bits & 0x80000000U) | 0x3f000000U);
+    return static_cast<int>(value + signed_half);
+}
+
 inline int8_t round_s8(float value) {
     const int rounded = round_half_away_from_zero(value);
     const int clamped = rounded < -127

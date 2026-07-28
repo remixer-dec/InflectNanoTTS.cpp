@@ -10,7 +10,8 @@
 namespace inflect {
 
 ModelLoader::~ModelLoader() {
-    if (buffer_) ggml_backend_buffer_free(buffer_);
+    release_weights();
+    if (file_)   std::fclose(file_);
     if (ctx_)    ggml_free(ctx_);
     if (gguf_)   gguf_free(gguf_);
 }
@@ -34,9 +35,22 @@ bool ModelLoader::load(const std::string& path) {
 }
 
 bool ModelLoader::load_selected(const std::string& path, const std::vector<std::string>& prefixes) {
-    const std::vector<std::string>* selected_prefixes = prefixes.empty() ? nullptr : &prefixes;
+    return open(path) && select(prefixes);
+}
 
-    // ── 1. Open GGUF and let GGML create tensor metadata ───────────
+bool ModelLoader::open(const std::string& path) {
+    if (gguf_) {
+        if (path_ == path) return true;
+        fprintf(stderr,
+                "[ModelLoader] Loader already indexes a different GGUF: %s\n",
+                path_.c_str());
+        return false;
+    }
+
+    const uint32_t started_ms = runtime_now_ms();
+
+    // Keep one parsed tensor catalog and one file handle across staged loads.
+    // Only the selected backend weight buffer is replaced between stages.
     struct gguf_init_params gguf_params = {
         /* .no_alloc = */ true,
         /* .ctx      = */ &ctx_,
@@ -54,28 +68,89 @@ bool ModelLoader::load_selected(const std::string& path, const std::vector<std::
         return false;
     }
 
-    // ── 2. Verify tensors by name ──────────────────────────────────
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(gguf_, i);
-        ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
-        if (!tensor) {
-            fprintf(stderr, "[ModelLoader] GGUF tensor missing from context: %s\n", name);
+        if (!ggml_get_tensor(ctx_, name)) {
+            fprintf(stderr,
+                    "[ModelLoader] GGUF tensor missing from context: %s\n",
+                    name);
             return false;
         }
     }
 
-    // ── 3. Allocate CPU backend storage for selected weight tensors ─
+    file_ = std::fopen(path.c_str(), "rb");
+    if (!file_) {
+        fprintf(stderr, "[ModelLoader] Failed to reopen GGUF: %s\n", path.c_str());
+        return false;
+    }
+    path_ = path;
+    fprintf(stderr,
+            "[ModelLoader] Indexed %d tensors elapsed_ms=%u from %s\n",
+            n_tensors,
+            static_cast<unsigned>(runtime_now_ms() - started_ms),
+            path.c_str());
+    return true;
+}
+
+void ModelLoader::release_weights() {
+    for (ggml_tensor* tensor : selected_tensors_) {
+        tensor->buffer = nullptr;
+        tensor->data = nullptr;
+    }
+    selected_tensors_.clear();
+    if (buffer_) {
+        ggml_backend_buffer_free(buffer_);
+        buffer_ = nullptr;
+    }
+}
+
+void ModelLoader::release_selected() {
+    release_weights();
+}
+
+bool ModelLoader::select(const std::vector<std::string>& prefixes) {
+    if (!gguf_ || !ctx_ || !file_) {
+        fprintf(stderr, "[ModelLoader] Cannot select tensors before opening GGUF\n");
+        return false;
+    }
+
+    const uint32_t started_ms = runtime_now_ms();
+    const std::vector<std::string>* selected_prefixes = prefixes.empty() ? nullptr : &prefixes;
+    release_weights();
+
+    struct SelectedTensor {
+        ggml_tensor* tensor;
+        size_t file_offset;
+        size_t buffer_offset;
+        size_t bytes;
+    };
+
+    const int n_tensors = gguf_get_n_tensors(gguf_);
     ggml_backend_buffer_type_t buft = runtime_weight_buffer_type();
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
     size_t total_alloc = 0;
-    int selected_count = 0;
+    size_t total_size = 0;
+    std::vector<SelectedTensor> selected;
+    selected.reserve(n_tensors);
     for (int i = 0; i < n_tensors; i++) {
         const char* name = gguf_get_tensor_name(gguf_, i);
         if (!selected_tensor(name, selected_prefixes)) continue;
         ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
         total_alloc = align_up(total_alloc, alignment);
+        const size_t bytes = ggml_nbytes(tensor);
+        selected.push_back({
+            tensor,
+            gguf_get_data_offset(gguf_) + gguf_get_tensor_offset(gguf_, i),
+            total_alloc,
+            bytes,
+        });
         total_alloc += ggml_backend_buft_get_alloc_size(buft, tensor);
-        selected_count++;
+        total_size += bytes;
+    }
+    if (selected.empty()) {
+        fprintf(stderr, "[ModelLoader] Tensor selection is empty in %s\n",
+                path_.c_str());
+        return false;
     }
 
     buffer_ = ggml_backend_buft_alloc_buffer(buft, total_alloc);
@@ -87,63 +162,91 @@ bool ModelLoader::load_selected(const std::string& path, const std::vector<std::
     mem_trace_rss("loader buffer allocated");
 
     char* base = static_cast<char*>(ggml_backend_buffer_get_base(buffer_));
-    size_t cursor = 0;
-    for (int i = 0; i < n_tensors; i++) {
-        const char* name = gguf_get_tensor_name(gguf_, i);
-        if (!selected_tensor(name, selected_prefixes)) continue;
-        ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
-        cursor = align_up(cursor, alignment);
-        if (ggml_backend_tensor_alloc(buffer_, tensor, base + cursor) != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "[ModelLoader] Failed to allocate tensor %s\n", name);
+    for (const SelectedTensor& item : selected) {
+        if (ggml_backend_tensor_alloc(
+                buffer_, item.tensor, base + item.buffer_offset) !=
+            GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[ModelLoader] Failed to allocate tensor %s\n",
+                    item.tensor->name);
             return false;
         }
-        cursor += ggml_backend_buft_get_alloc_size(buft, tensor);
+        selected_tensors_.push_back(item.tensor);
+    }
+    const uint32_t allocated_ms = runtime_now_ms();
+
+    // GGUF writes tensors in aligned file order. When the selected tensors
+    // form one packed range, their file offsets exactly match our backend
+    // offsets, so one seek/read replaces per-tensor seeks and copies.
+    const size_t first_file_offset = selected.front().file_offset;
+    bool bulk_layout = ggml_backend_buffer_is_host(buffer_);
+    for (const SelectedTensor& item : selected) {
+        bulk_layout =
+            bulk_layout &&
+            item.file_offset == first_file_offset + item.buffer_offset;
     }
 
-    // ── 4. Load tensor data from GGUF into backend tensors ─────────
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) {
-        fprintf(stderr, "[ModelLoader] Failed to reopen GGUF: %s\n", path.c_str());
-        return false;
-    }
-
-    size_t total_size = 0;
-    std::vector<uint8_t> data(8 * 1024);
-    for (int i = 0; i < n_tensors; i++) {
-        const char* name = gguf_get_tensor_name(gguf_, i);
-        if (!selected_tensor(name, selected_prefixes)) continue;
-        ggml_tensor* tensor = ggml_get_tensor(ctx_, name);
-
-        size_t offset = gguf_get_data_offset(gguf_) + gguf_get_tensor_offset(gguf_, i);
-        size_t nbytes = ggml_nbytes(tensor);
-        total_size += nbytes;
-
-        if (fseek(f, (long)offset, SEEK_SET) != 0) {
-            fprintf(stderr, "[ModelLoader] Failed to seek tensor %s\n", name);
-            fclose(f);
+    if (bulk_layout) {
+        if (std::fseek(file_, static_cast<long>(first_file_offset), SEEK_SET) != 0) {
+            fprintf(stderr, "[ModelLoader] Failed to seek bulk tensor range\n");
             return false;
         }
-
         size_t done = 0;
-        while (done < nbytes) {
-            const size_t chunk = std::min(data.size(), nbytes - done);
-            size_t read = fread(data.data(), 1, chunk, f);
+        while (done < total_alloc) {
+            const size_t chunk =
+                std::min<size_t>(64 * 1024, total_alloc - done);
+            const size_t read =
+                std::fread(base + done, 1, chunk, file_);
             if (read != chunk) {
-                fprintf(stderr, "[ModelLoader] Short read for tensor %s: %zu/%zu\n",
-                        name, done + read, nbytes);
-                fclose(f);
+                fprintf(stderr,
+                        "[ModelLoader] Short bulk read: %zu/%zu\n",
+                        done + read, total_alloc);
                 return false;
             }
-            ggml_backend_tensor_set(tensor, data.data(), done, chunk);
             done += chunk;
         }
+    } else {
+        std::vector<uint8_t> data(8 * 1024);
+        for (const SelectedTensor& item : selected) {
+            if (std::fseek(
+                    file_, static_cast<long>(item.file_offset), SEEK_SET) != 0) {
+                fprintf(stderr, "[ModelLoader] Failed to seek tensor %s\n",
+                        item.tensor->name);
+                return false;
+            }
+            size_t done = 0;
+            while (done < item.bytes) {
+                const size_t chunk =
+                    std::min(data.size(), item.bytes - done);
+                const size_t read =
+                    std::fread(data.data(), 1, chunk, file_);
+                if (read != chunk) {
+                    fprintf(
+                        stderr,
+                        "[ModelLoader] Short read for tensor %s: %zu/%zu\n",
+                        item.tensor->name, done + read, item.bytes);
+                    return false;
+                }
+                ggml_backend_tensor_set(
+                    item.tensor, data.data(), done, chunk);
+                done += chunk;
+            }
+        }
     }
-    fclose(f);
     mem_release_to_os();
     mem_trace_rss("loader tensors loaded");
 
-    fprintf(stderr, "[ModelLoader] Loaded %d/%d tensors (%.2f MB) from %s\n",
-            selected_count, n_tensors, total_size / 1024.0 / 1024.0, path.c_str());
+    fprintf(
+        stderr,
+        "[ModelLoader] Loaded %u/%d tensors (%.2f MB) io=%s "
+        "alloc_ms=%u read_ms=%u total_ms=%u from %s\n",
+        static_cast<unsigned>(selected.size()),
+        n_tensors,
+        total_size / 1024.0 / 1024.0,
+        bulk_layout ? "bulk" : "tensor",
+        static_cast<unsigned>(allocated_ms - started_ms),
+        static_cast<unsigned>(runtime_now_ms() - allocated_ms),
+        static_cast<unsigned>(runtime_now_ms() - started_ms),
+        path_.c_str());
     return true;
 }
 

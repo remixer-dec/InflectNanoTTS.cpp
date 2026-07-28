@@ -105,6 +105,12 @@ void runtime_trace_heap(const char* label) {
     }
 }
 
+bool runtime_cancelled() {
+    return g_runtime_config.cancelled &&
+           g_runtime_config.cancelled(
+               g_runtime_config.cancellation_user);
+}
+
 #if defined(INFLECT_LOW_MEMORY)
 void runtime_cooperate() {
     if (g_runtime_config.cooperate) {
@@ -148,6 +154,7 @@ void runtime_dot_s8_scaled_blocks_32(
     float* results,
     size_t blocks,
     size_t rows,
+    bool skip_zero_scale_blocks,
     uint64_t* dot_cycles,
     uint64_t* scale_cycles
 ) {
@@ -160,6 +167,7 @@ void runtime_dot_s8_scaled_blocks_32(
             results,
             blocks,
             rows,
+            skip_zero_scale_blocks,
             dot_cycles,
             scale_cycles);
         return;
@@ -171,13 +179,18 @@ void runtime_dot_s8_scaled_blocks_32(
     for (size_t row = 0; row < rows; ++row) {
         float result = 0.0f;
         for (size_t block = 0; block < blocks; ++block) {
+            const size_t input_block = row * blocks + block;
+            if (skip_zero_scale_blocks &&
+                input_scales[input_block] == 0.0f) {
+                continue;
+            }
             const uint32_t dot_started =
                 profile ? runtime_now_cycles() : 0;
             int32_t sum = 0;
             const int8_t* weight =
                 weights + block * 32;
             const int8_t* input =
-                inputs + (row * blocks + block) * 32;
+                inputs + input_block * 32;
             for (size_t i = 0; i < 32; ++i) {
                 sum += static_cast<int32_t>(weight[i]) *
                        static_cast<int32_t>(input[i]);
@@ -186,7 +199,7 @@ void runtime_dot_s8_scaled_blocks_32(
                 profile ? runtime_now_cycles() : 0;
             result += static_cast<float>(sum) *
                       weight_scales[block] *
-                      input_scales[row * blocks + block];
+                      input_scales[input_block];
             if (profile) {
                 const uint32_t scale_finished =
                     runtime_now_cycles();
@@ -438,6 +451,13 @@ static void debug_save_i32(const std::string& dir, const std::string& name,
     debug_manifest(dir, name + " i32 " + shape + " count=" + std::to_string(data.size()));
 }
 
+static bool backend_abort_callback(void*) {
+#if defined(INFLECT_LOW_MEMORY)
+    runtime_cooperate();
+#endif
+    return runtime_cancelled();
+}
+
 void Synthesizer::init_backend(int n_threads) {
     if (g_backend) return;
     g_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -454,6 +474,8 @@ void Synthesizer::init_backend(int n_threads) {
     }
     if (ggml_backend_is_cpu(g_backend)) {
         ggml_backend_cpu_set_n_threads(g_backend, threads);
+        ggml_backend_cpu_set_abort_callback(
+            g_backend, backend_abort_callback, nullptr);
     }
     fprintf(stderr, "[Synthesizer] Backend initialized threads=%d simd=%s\n",
             threads,
@@ -522,6 +544,10 @@ bool Synthesizer::load_acoustic(const std::string& path) {
 #else
     const bool ok = acoustic_->load(*acoustic_loader_);
 #endif
+    if (!ok) {
+        acoustic_.reset();
+        acoustic_loader_.reset();
+    }
     mem_trace_rss("after acoustic load");
     return ok;
 }
@@ -593,7 +619,8 @@ bool Synthesizer::load_v2(const std::string& model_path,
     v2_model_ = std::move(model);
     v2_model_path_ = model_path;
     fprintf(stderr,
-            "[Synthesizer] Loaded Inflect v2 model=%s lexicon=%s symbols=%s\n",
+            "[Synthesizer] Loaded Inflect v2 model=%s lexicon=%s symbols=%s"
+            " weight_mode=staged\n",
             model_path.c_str(), lexicon_path.c_str(), v2::kSymbolHashHex);
     mem_trace_rss("after v2 load");
     return true;
@@ -757,7 +784,8 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
         };
         v2_loader_ = std::make_unique<ModelLoader>();
         v2_model_ = std::make_unique<V2Model>();
-        if (!v2_loader_->load_selected(v2_model_path_, duration_prefixes) ||
+        if (!v2_loader_->load_selected(
+                v2_model_path_, duration_prefixes) ||
             !v2_model_->load_duration(*v2_loader_)) {
             fprintf(stderr, "[Synthesizer] Failed to load V2 duration stage\n");
             v2_model_.reset();
@@ -766,6 +794,7 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
         }
     }
 #endif
+    const uint32_t duration_started_ms = runtime_now_ms();
     V2DurationFlowOutput latent = v2_model_->duration_and_flow(
         tokens, params.speed, params.variation, params.seed, fixed_noise,
 #if defined(INFLECT_LOW_MEMORY)
@@ -774,6 +803,21 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
         true
 #endif
     );
+    fprintf(stderr,
+            "[V2Stage] duration compute_ms=%u frames=%d channels=%d\n",
+            static_cast<unsigned>(
+                runtime_now_ms() - duration_started_ms),
+            latent.frames,
+            latent.channels);
+    if (runtime_cancelled()) {
+#if defined(INFLECT_LOW_MEMORY)
+        v2_model_.reset();
+        v2_loader_.reset();
+        mem_release_to_os();
+#endif
+        fprintf(stderr, "[Synthesizer] V2 duration cancelled\n");
+        return;
+    }
     if (latent.frames <= 0) {
 #if defined(INFLECT_LOW_MEMORY)
         v2_model_.reset();
@@ -784,24 +828,71 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
 #if defined(INFLECT_LOW_MEMORY)
     const bool use_staged_decoder =
         latent.channels >= 192;
-    v2_loader_.reset();
-    mem_release_to_os();
-    runtime_trace_heap("v2 duration released");
+    const bool group_flow_weights = !use_staged_decoder;
+    runtime_trace_heap("v2 duration complete");
+
+    uint32_t grouped_flow_load_ms = 0;
+    if (group_flow_weights) {
+        const uint32_t load_started_ms = runtime_now_ms();
+        if (!v2_loader_->select({"flow.flows."})) {
+            fprintf(stderr, "[Synthesizer] Failed grouped V2 flow load\n");
+            v2_model_.reset();
+            v2_loader_.reset();
+            return;
+        }
+        grouped_flow_load_ms = runtime_now_ms() - load_started_ms;
+        fprintf(
+            stderr,
+            "[V2Stage] grouped flow load_ms=%u\n",
+            static_cast<unsigned>(grouped_flow_load_ms));
+        runtime_trace_heap("v2 grouped flows loaded");
+    }
     for (int flow = 6; flow >= 0; flow -= 2) {
+        if (runtime_cancelled()) {
+            v2_model_.reset();
+            v2_loader_.reset();
+            mem_release_to_os();
+            fprintf(stderr, "[Synthesizer] V2 flow cancelled\n");
+            return;
+        }
         const std::string prefix =
             "flow.flows." + std::to_string(flow) + ".";
-        v2_loader_ = std::make_unique<ModelLoader>();
-        if (!v2_loader_->load_selected(v2_model_path_, {prefix}) ||
-            !v2_model_->load_flow_block(*v2_loader_, flow) ||
-            !v2_model_->reverse_flow_block(latent, flow)) {
+        const uint32_t load_started_ms = runtime_now_ms();
+        if ((!group_flow_weights && !v2_loader_->select({prefix})) ||
+            !v2_model_->load_flow_block(*v2_loader_, flow)) {
+            fprintf(stderr, "[Synthesizer] Failed V2 flow load %d\n", flow);
+            v2_model_.reset();
+            v2_loader_.reset();
+            return;
+        }
+        const uint32_t compute_started_ms = runtime_now_ms();
+        if (!v2_model_->reverse_flow_block(latent, flow)) {
             fprintf(stderr, "[Synthesizer] Failed V2 reverse flow block %d\n", flow);
             v2_model_.reset();
             v2_loader_.reset();
             return;
         }
-        v2_loader_.reset();
-        mem_release_to_os();
-        runtime_trace_heap(("v2 flow " + std::to_string(flow) + " released").c_str());
+        if (runtime_cancelled()) {
+            v2_model_.reset();
+            v2_loader_.reset();
+            mem_release_to_os();
+            fprintf(stderr, "[Synthesizer] V2 flow cancelled\n");
+            return;
+        }
+        fprintf(
+            stderr,
+            "[V2Stage] flow=%d load_ms=%u compute_ms=%u\n",
+            flow,
+            static_cast<unsigned>(
+                group_flow_weights
+                    ? 0
+                    : compute_started_ms - load_started_ms),
+            static_cast<unsigned>(
+                runtime_now_ms() - compute_started_ms));
+        if (!group_flow_weights) {
+            runtime_trace_heap(
+                ("v2 flow " + std::to_string(flow) + " complete").c_str());
+        }
     }
     if (use_staged_decoder) {
         if (!v2_model_->prepare_staged_decoder()) {
@@ -811,10 +902,12 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
             v2_model_.reset();
             return;
         }
+        v2_loader_.reset();
+        mem_release_to_os();
+        runtime_trace_heap("v2 acoustic weights released");
     } else {
-        v2_loader_ = std::make_unique<ModelLoader>();
-        if (!v2_loader_->load_selected(
-                v2_model_path_, {"dec."}) ||
+        const uint32_t decoder_load_started_ms = runtime_now_ms();
+        if (!v2_loader_->select({"dec."}) ||
             !v2_model_->load_decoder(*v2_loader_)) {
             fprintf(
                 stderr,
@@ -823,6 +916,11 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
             v2_loader_.reset();
             return;
         }
+        fprintf(
+            stderr,
+            "[V2Stage] decoder load_ms=%u\n",
+            static_cast<unsigned>(
+                runtime_now_ms() - decoder_load_started_ms));
     }
 #endif
     V2FadeSink sink{std::move(callback)};
@@ -974,6 +1072,10 @@ void Synthesizer::synthesize_streaming(
     uint32_t stage_start_ms = synth_start_ms;
     const std::string vocoder_backend = selected_vocoder_backend(params);
     fprintf(stderr, "[Synthesizer] Vocoder backend=%s\n", vocoder_backend.c_str());
+    if (!frontend_ || !acoustic_) {
+        fprintf(stderr, "[Synthesizer] V1 frontend/acoustic model not loaded\n");
+        return;
+    }
     const std::string dump_dir = debug_dump_dir();
     if (!dump_dir.empty()) {
         ensure_debug_dir(dump_dir);
@@ -1005,6 +1107,10 @@ void Synthesizer::synthesize_streaming(
         tokens.phone_ids, tokens.tone_ids, tokens.lang_ids,
         params.speaker_id, g_backend
     );
+    if (runtime_cancelled() || enc_out.encoded.empty()) {
+        fprintf(stderr, "[Synthesizer] Encoder stopped\n");
+        return;
+    }
 #if defined(INFLECT_LOW_MEMORY)
     mem_release_to_os();
 #endif
@@ -1065,34 +1171,45 @@ void Synthesizer::synthesize_streaming(
 #if defined(INFLECT_LOW_MEMORY)
     enc_out = EncoderOutput{};
     acoustic_.reset();
-    acoustic_loader_.reset();
+    acoustic_loader_->release_selected();
     mem_release_to_os();
     mem_trace_rss("after acoustic encoder release");
 
-    acoustic_loader_ = std::make_unique<ModelLoader>();
-    std::vector<std::string> decoder_prefixes = {"decoder.", "frame_gru.", "mel_head."};
+    std::vector<std::string> decoder_prefixes = {
+        "decoder.", "frame_gru.", "mel_head.",
+    };
 #if !INFLECT_ACOUSTIC_SKIP_POSTNET
     decoder_prefixes.push_back("postnet.");
 #endif
-    if (!acoustic_loader_->load_selected(acoustic_path_, decoder_prefixes)) {
-        fprintf(stderr, "[Synthesizer] Failed to reload decoder-only acoustic model\n");
+    if (!acoustic_loader_->select(decoder_prefixes)) {
+        fprintf(
+            stderr,
+            "[Synthesizer] Failed to reload decoder-only acoustic model\n");
         return;
     }
     acoustic_ = std::make_unique<AcousticModel>(acoustic_config_);
     if (!acoustic_->load_decoder(*acoustic_loader_)) {
-        fprintf(stderr, "[Synthesizer] Failed to bind decoder-only acoustic model\n");
+        fprintf(
+            stderr,
+            "[Synthesizer] Failed to bind decoder-only acoustic model\n");
         return;
     }
     mem_trace_rss("after acoustic decoder reload");
     mem_trace_heap("after acoustic decoder reload");
-    fprintf(stderr, "[Synthesizer] Acoustic decoder reloaded stage_ms=%u total_ms=%u\n",
-            (unsigned)(runtime_now_ms() - stage_start_ms),
-            (unsigned)(runtime_now_ms() - synth_start_ms));
+    fprintf(
+        stderr,
+        "[Synthesizer] Acoustic decoder reloaded stage_ms=%u total_ms=%u\n",
+        (unsigned)(runtime_now_ms() - stage_start_ms),
+        (unsigned)(runtime_now_ms() - synth_start_ms));
     stage_start_ms = runtime_now_ms();
 #endif
 
     // ── 4. Graph 2: Decoder → Mel ───────────────────────────────────
     auto mel = acoustic_->run_decoder(features, g_backend);
+    if (runtime_cancelled() || mel.empty()) {
+        fprintf(stderr, "[Synthesizer] Decoder stopped\n");
+        return;
+    }
     mem_trace_rss("after decoder");
     mem_trace_heap("after decoder");
     int n_mels = acoustic_->config().n_mels;
