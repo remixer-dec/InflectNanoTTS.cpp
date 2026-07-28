@@ -28,6 +28,9 @@ public:
     bool load_duration(ModelLoader& loader);
     bool load_flow_block(ModelLoader& loader, int flow_index);
     bool load_decoder(ModelLoader& loader);
+#if defined(INFLECT_LOW_MEMORY)
+    bool prepare_staged_decoder();
+#endif
     V2DurationFlowOutput duration_and_flow(
         const std::vector<uint8_t>& blanked_tokens,
         float speed,
@@ -46,6 +49,15 @@ public:
         ggml_backend_t backend,
         AudioCallback callback
     );
+#if defined(INFLECT_LOW_MEMORY)
+    bool decode_staged(
+        const std::string& model_path,
+        const std::vector<float>& latent,
+        int frames,
+        ggml_backend_t backend,
+        AudioCallback callback
+    );
+#endif
 
 private:
     ModelLoader* loader_ = nullptr;

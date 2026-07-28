@@ -1,14 +1,18 @@
 #include "vocoder_model.h"
 #include "inflect-nano.h"
 #include "memory_trace.h"
-#include <ggml-cpu.h>
+#include "vocoder_quant_math.h"
+#include "../ggml/include/ggml-cpu.h"
 #include <cmath>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
+#include <new>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -33,21 +37,42 @@
 #define INFLECT_PROFILE_VOCODER_OPS 0
 #endif
 
-#ifndef INFLECT_USE_RESBLOCK_IM2COL
-#define INFLECT_USE_RESBLOCK_IM2COL 1
-#endif
-
 namespace inflect {
 
-struct FloatScratch {
+struct VocoderFloatScratch {
     float* ptr = nullptr;
     size_t cap = 0;
 
-    ~FloatScratch() {
+    ~VocoderFloatScratch() {
         runtime_free_scratch(ptr);
     }
 
+#if defined(INFLECT_LOW_MEMORY)
+    bool try_resize(size_t n) {
+        if (n <= cap) {
+            return true;
+        }
+        runtime_free_scratch(ptr);
+        ptr = nullptr;
+        cap = 0;
+        float* next = static_cast<float*>(
+            runtime_alloc_scratch(n * sizeof(float), ScratchMemoryKind::Psram));
+        if (next == nullptr) {
+            return false;
+        }
+        ptr = next;
+        cap = n;
+        return true;
+    }
+#endif
+
     void resize(size_t n) {
+#if defined(INFLECT_LOW_MEMORY)
+        if (!try_resize(n)) {
+            fprintf(stderr, "[VocoderModel] scratch allocation failed floats=%zu\n", n);
+            std::abort();
+        }
+#else
         if (n <= cap) {
             return;
         }
@@ -60,17 +85,18 @@ struct FloatScratch {
         runtime_free_scratch(ptr);
         ptr = next;
         cap = n;
+#endif
     }
 
     float* data() { return ptr; }
     const float* data() const { return ptr; }
 };
 
-struct InternalFloatScratch {
+struct VocoderInternalFloatScratch {
     float* ptr = nullptr;
     size_t cap = 0;
 
-    ~InternalFloatScratch() {
+    ~VocoderInternalFloatScratch() {
         runtime_free_scratch(ptr);
     }
 
@@ -92,6 +118,63 @@ struct InternalFloatScratch {
     float* data() { return ptr; }
 };
 
+#if defined(INFLECT_LOW_MEMORY)
+constexpr int kQ4BlockElements = 32;
+
+struct PackedQ4Block {
+    ggml_fp16_t scale;
+    uint8_t quants[kQ4BlockElements / 2];
+};
+
+static_assert(
+    sizeof(PackedQ4Block) ==
+        sizeof(ggml_fp16_t) + kQ4BlockElements / 2,
+    "unexpected Q4_0 block layout");
+
+using Q4Q8Scale = float;
+
+static Q4Q8Scale cache_weight_scale(ggml_fp16_t scale) {
+    return ggml_fp16_to_fp32(scale);
+}
+
+static float read_cached_scale(Q4Q8Scale scale) {
+    return scale;
+}
+
+struct VocoderInternalByteScratch {
+    void* allocation = nullptr;
+    void* ptr = nullptr;
+    size_t cap = 0;
+
+    ~VocoderInternalByteScratch() {
+        runtime_free_scratch(allocation);
+    }
+
+    bool try_resize(size_t n) {
+        if (n <= cap) {
+            return true;
+        }
+        runtime_free_scratch(allocation);
+        allocation = runtime_alloc_scratch(
+            n + 15, ScratchMemoryKind::InternalPreferred);
+        if (allocation == nullptr) {
+            ptr = nullptr;
+            cap = 0;
+            return false;
+        }
+        const uintptr_t address =
+            reinterpret_cast<uintptr_t>(allocation);
+        ptr = reinterpret_cast<void*>(
+            (address + 15) & ~uintptr_t(15));
+        cap = n;
+        return true;
+    }
+
+    void* data() { return ptr; }
+    const void* data() const { return ptr; }
+};
+#endif
+
 static uint32_t now_ms() { return runtime_now_ms(); }
 
 #if INFLECT_PROFILE_VOCODER_OPS
@@ -108,20 +191,38 @@ struct VocodeOpProfile {
 
 static VocodeOpProfile g_vocode_profile;
 
+struct VocodePackedProfile {
+    std::atomic<uint64_t> input_gather_cycles{0};
+    std::atomic<uint64_t> input_quant_cycles{0};
+    std::atomic<uint64_t> input_max_cycles{0};
+    std::atomic<uint64_t> input_scale_cycles{0};
+    std::atomic<uint64_t> input_convert_cycles{0};
+    std::atomic<uint64_t> q4_unpack_cycles{0};
+    std::atomic<uint64_t> s8_dot_cycles{0};
+    std::atomic<uint64_t> scale_reduce_cycles{0};
+    std::atomic<uint64_t> output_write_cycles{0};
+};
+
+static VocodePackedProfile g_vocode_packed_profile;
+
 struct VocodeOpProfileBucket {
     const char* label;
     std::atomic<uint32_t> calls;
     std::atomic<uint64_t> elapsed_ms;
     std::atomic<uint64_t> outputs;
     std::atomic<uint64_t> macs;
+    std::atomic<uint64_t> input_blocks;
+    std::atomic<uint64_t> zero_input_blocks;
+    std::atomic<uint64_t> input_values;
+    std::atomic<uint64_t> zero_input_values;
 };
 
 static VocodeOpProfileBucket g_vocode_profile_buckets[] = {
-    {"conv_pre", {}, {}, {}, {}},
-    {"upsample", {}, {}, {}, {}},
-    {"resblock.convs1", {}, {}, {}, {}},
-    {"resblock.convs2", {}, {}, {}, {}},
-    {"conv_post", {}, {}, {}, {}},
+    {"conv_pre", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"upsample", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"resblock.convs1", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"resblock.convs2", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"conv_post", {}, {}, {}, {}, {}, {}, {}, {}},
 };
 
 static void vocode_profile_reset() {
@@ -133,11 +234,78 @@ static void vocode_profile_reset() {
     g_vocode_profile.conv_transpose_outputs.store(0);
     g_vocode_profile.conv1d_macs.store(0);
     g_vocode_profile.conv_transpose_macs.store(0);
+    g_vocode_packed_profile.input_quant_cycles.store(0);
+    g_vocode_packed_profile.input_gather_cycles.store(0);
+    g_vocode_packed_profile.input_max_cycles.store(0);
+    g_vocode_packed_profile.input_scale_cycles.store(0);
+    g_vocode_packed_profile.input_convert_cycles.store(0);
+    g_vocode_packed_profile.q4_unpack_cycles.store(0);
+    g_vocode_packed_profile.s8_dot_cycles.store(0);
+    g_vocode_packed_profile.scale_reduce_cycles.store(0);
+    g_vocode_packed_profile.output_write_cycles.store(0);
     for (auto& bucket : g_vocode_profile_buckets) {
         bucket.calls.store(0);
         bucket.elapsed_ms.store(0);
         bucket.outputs.store(0);
         bucket.macs.store(0);
+        bucket.input_blocks.store(0);
+        bucket.zero_input_blocks.store(0);
+        bucket.input_values.store(0);
+        bucket.zero_input_values.store(0);
+    }
+}
+
+static void vocode_profile_add_packed(
+    uint64_t input_gather_cycles,
+    uint64_t input_quant_cycles,
+    uint64_t input_max_cycles,
+    uint64_t input_scale_cycles,
+    uint64_t input_convert_cycles,
+    uint64_t q4_unpack_cycles,
+    uint64_t s8_dot_cycles,
+    uint64_t scale_reduce_cycles,
+    uint64_t output_write_cycles
+) {
+    g_vocode_packed_profile.input_gather_cycles.fetch_add(
+        input_gather_cycles);
+    g_vocode_packed_profile.input_quant_cycles.fetch_add(
+        input_quant_cycles);
+    g_vocode_packed_profile.input_max_cycles.fetch_add(
+        input_max_cycles);
+    g_vocode_packed_profile.input_scale_cycles.fetch_add(
+        input_scale_cycles);
+    g_vocode_packed_profile.input_convert_cycles.fetch_add(
+        input_convert_cycles);
+    g_vocode_packed_profile.q4_unpack_cycles.fetch_add(
+        q4_unpack_cycles);
+    g_vocode_packed_profile.s8_dot_cycles.fetch_add(
+        s8_dot_cycles);
+    g_vocode_packed_profile.scale_reduce_cycles.fetch_add(
+        scale_reduce_cycles);
+    g_vocode_packed_profile.output_write_cycles.fetch_add(
+        output_write_cycles);
+}
+
+static void vocode_profile_add_input_sparsity(
+    const char* label,
+    uint64_t input_blocks,
+    uint64_t zero_input_blocks,
+    uint64_t input_values,
+    uint64_t zero_input_values
+) {
+    if (label == nullptr) {
+        return;
+    }
+    for (auto& bucket : g_vocode_profile_buckets) {
+        if (std::strcmp(bucket.label, label) == 0) {
+            bucket.input_blocks.fetch_add(input_blocks);
+            bucket.zero_input_blocks.fetch_add(
+                zero_input_blocks);
+            bucket.input_values.fetch_add(input_values);
+            bucket.zero_input_values.fetch_add(
+                zero_input_values);
+            return;
+        }
     }
 }
 
@@ -175,15 +343,20 @@ static void vocode_profile_add_conv_transpose(const char* label, uint32_t elapse
 static void vocode_profile_log(uint32_t graph_compute_ms) {
     const uint64_t conv1d_ms = g_vocode_profile.conv1d_ms.load();
     const uint64_t conv_transpose_ms = g_vocode_profile.conv_transpose_ms.load();
-    const uint64_t custom_ms = conv1d_ms + conv_transpose_ms;
-    const int64_t other_ms = (int64_t)graph_compute_ms - (int64_t)custom_ms;
+    const uint64_t custom_worker_ms =
+        conv1d_ms + conv_transpose_ms;
+    const uint64_t active_workers_x100 =
+        graph_compute_ms > 0
+            ? custom_worker_ms * 100ULL / graph_compute_ms
+            : 0;
     fprintf(stderr,
-            "[VocoderProfile] graph_ms=%u custom_ms=%llu other_ms=%lld "
+            "[VocoderProfile] graph_ms=%u custom_worker_ms=%llu "
+            "active_workers_x100=%llu "
             "conv1d_calls=%u conv1d_ms=%llu conv1d_outputs=%llu conv1d_macs=%llu "
             "convT_calls=%u convT_ms=%llu convT_outputs=%llu convT_macs=%llu\n",
             (unsigned)graph_compute_ms,
-            (unsigned long long)custom_ms,
-            (long long)other_ms,
+            (unsigned long long)custom_worker_ms,
+            (unsigned long long)active_workers_x100,
             (unsigned)g_vocode_profile.conv1d_calls.load(),
             (unsigned long long)conv1d_ms,
             (unsigned long long)g_vocode_profile.conv1d_outputs.load(),
@@ -209,7 +382,65 @@ static void vocode_profile_log(uint32_t graph_compute_ms) {
                 (unsigned long long)macs,
                 outputs > 0 ? (unsigned long long)((elapsed_ms * 1000ULL) / outputs) : 0ULL,
                 macs > 0 ? (unsigned long long)((elapsed_ms * 1000000ULL) / macs) : 0ULL);
+        const uint64_t input_blocks =
+            bucket.input_blocks.load();
+        const uint64_t zero_input_blocks =
+            bucket.zero_input_blocks.load();
+        const uint64_t input_values =
+            bucket.input_values.load();
+        const uint64_t zero_input_values =
+            bucket.zero_input_values.load();
+        if (input_blocks > 0) {
+            fprintf(
+                stderr,
+                "[VocoderInputSparsity] op=%s "
+                "blocks=%llu zero_blocks=%llu "
+                "zero_blocks_pct_x100=%llu "
+                "values=%llu zero_values=%llu "
+                "zero_values_pct_x100=%llu\n",
+                bucket.label,
+                (unsigned long long)input_blocks,
+                (unsigned long long)zero_input_blocks,
+                (unsigned long long)(
+                    zero_input_blocks * 10000ULL /
+                    input_blocks),
+                (unsigned long long)input_values,
+                (unsigned long long)zero_input_values,
+                (unsigned long long)(
+                    input_values > 0
+                        ? zero_input_values * 10000ULL /
+                              input_values
+                        : 0));
+        }
     }
+#if defined(INFLECT_LOW_MEMORY)
+    fprintf(stderr,
+            "[VocoderPackedProfile] tile=%d input_gather_cycles=%llu "
+            "input_quant_cycles=%llu "
+            "input_max_cycles=%llu input_scale_cycles=%llu "
+            "input_convert_cycles=%llu "
+            "q4_unpack_cycles=%llu s8_dot_cycles=%llu "
+            "scale_reduce_cycles=%llu output_write_cycles=%llu\n",
+            runtime_packed_quant_time_tile(),
+            (unsigned long long)
+                g_vocode_packed_profile.input_gather_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.input_quant_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.input_max_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.input_scale_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.input_convert_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.q4_unpack_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.s8_dot_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.scale_reduce_cycles.load(),
+            (unsigned long long)
+                g_vocode_packed_profile.output_write_cycles.load());
+#endif
 }
 #else
 static void vocode_profile_reset() {}
@@ -309,7 +540,722 @@ static bool is_resblock_conv_label(const char* label) {
             std::strcmp(label, "resblock.convs2") == 0);
 }
 
-static void quant_conv1d_resblock_im2col_op(
+#if defined(INFLECT_LOW_MEMORY)
+struct Q4Q8TileDot {
+    int64_t elements = 0;
+    int64_t blocks = 0;
+    VocoderInternalByteScratch input_values;
+    VocoderInternalByteScratch input_scales;
+    VocoderInternalByteScratch weight_values;
+    VocoderInternalByteScratch weight_scale_bits;
+    VocoderInternalByteScratch weight_scales;
+    VocoderInternalByteScratch sums;
+    VocoderInternalByteScratch results;
+    QuantizeF32ToQ8Blocks32Fn quantize_blocks_32 = nullptr;
+#if INFLECT_PROFILE_VOCODER_OPS
+    uint64_t input_gather_cycles = 0;
+    uint64_t input_quant_cycles = 0;
+    uint64_t input_max_cycles = 0;
+    uint64_t input_scale_cycles = 0;
+    uint64_t input_convert_cycles = 0;
+    uint64_t q4_unpack_cycles = 0;
+    uint64_t s8_dot_cycles = 0;
+    uint64_t scale_reduce_cycles = 0;
+    uint64_t profiled_input_blocks = 0;
+    uint64_t profiled_zero_input_blocks = 0;
+    uint64_t profiled_input_values = 0;
+    uint64_t profiled_zero_input_values = 0;
+#endif
+
+    bool init(int64_t count, int tile_capacity) {
+        if (count <= 0 || count % kQ4BlockElements != 0 ||
+            tile_capacity <= 0) {
+            return false;
+        }
+        elements = count;
+        blocks = count / kQ4BlockElements;
+        quantize_blocks_32 =
+            runtime_config().quantize_f32_to_q8_blocks_32;
+        return input_values.try_resize(
+                   static_cast<size_t>(elements) *
+                   static_cast<size_t>(tile_capacity)) &&
+               input_scales.try_resize(
+                   static_cast<size_t>(blocks) *
+                   static_cast<size_t>(tile_capacity) *
+                   sizeof(Q4Q8Scale)) &&
+               weight_values.try_resize(
+                   static_cast<size_t>(elements)) &&
+               weight_scale_bits.try_resize(
+                   static_cast<size_t>(blocks) *
+                   sizeof(uint16_t)) &&
+               weight_scales.try_resize(
+                   static_cast<size_t>(blocks) *
+                   sizeof(Q4Q8Scale)) &&
+               results.try_resize(
+                   static_cast<size_t>(tile_capacity) *
+                   sizeof(float)) &&
+               (runtime_has_s8_scaled_dot_blocks_32() ||
+                sums.try_resize(
+                    static_cast<size_t>(blocks) *
+                    static_cast<size_t>(tile_capacity) *
+                    sizeof(int32_t)));
+    }
+
+    __attribute__((always_inline)) inline void quantize_blocks(
+        int tile,
+        int64_t first_block,
+        const float* values,
+        int64_t block_count,
+        bool skip_zero_blocks
+    ) {
+#if INFLECT_PROFILE_VOCODER_OPS
+        uint64_t window_zero_values = 0;
+        uint64_t window_zero_blocks = 0;
+        for (int64_t block = 0; block < block_count; ++block) {
+            uint64_t block_zero_values = 0;
+            for (int index = 0; index < kQ4BlockElements; ++index) {
+                block_zero_values += static_cast<uint64_t>(
+                    values[block * kQ4BlockElements + index] ==
+                    0.0f);
+            }
+            window_zero_values += block_zero_values;
+            window_zero_blocks += static_cast<uint64_t>(
+                block_zero_values == kQ4BlockElements);
+        }
+        profiled_input_values +=
+            static_cast<uint64_t>(
+                block_count * kQ4BlockElements);
+        profiled_zero_input_values += window_zero_values;
+        profiled_input_blocks +=
+            static_cast<uint64_t>(block_count);
+        profiled_zero_input_blocks += window_zero_blocks;
+        const uint32_t started = runtime_now_cycles();
+#endif
+        auto* quantized =
+            static_cast<int8_t*>(input_values.data()) +
+            static_cast<size_t>(tile) *
+                static_cast<size_t>(elements) +
+            static_cast<size_t>(first_block) *
+                kQ4BlockElements;
+        auto* scales =
+            static_cast<Q4Q8Scale*>(input_scales.data()) +
+            static_cast<size_t>(tile) *
+                static_cast<size_t>(blocks) +
+            static_cast<size_t>(first_block);
+#if INFLECT_PROFILE_VOCODER_OPS
+        uint64_t max_cycles = 0;
+        uint64_t scale_cycles = 0;
+        uint64_t convert_cycles = 0;
+        uint64_t* max_cycles_ptr = &max_cycles;
+        uint64_t* scale_cycles_ptr = &scale_cycles;
+        uint64_t* convert_cycles_ptr = &convert_cycles;
+#else
+        uint64_t* max_cycles_ptr = nullptr;
+        uint64_t* scale_cycles_ptr = nullptr;
+        uint64_t* convert_cycles_ptr = nullptr;
+#endif
+        if (quantize_blocks_32 != nullptr) {
+            quantize_blocks_32(
+                values,
+                quantized,
+                scales,
+                static_cast<size_t>(block_count),
+                skip_zero_blocks,
+                max_cycles_ptr,
+                scale_cycles_ptr,
+                convert_cycles_ptr);
+        } else {
+            runtime_quantize_f32_to_q8_blocks_32(
+                values,
+                quantized,
+                scales,
+                static_cast<size_t>(block_count),
+                skip_zero_blocks,
+                max_cycles_ptr,
+                scale_cycles_ptr,
+                convert_cycles_ptr);
+        }
+#if INFLECT_PROFILE_VOCODER_OPS
+        input_max_cycles += max_cycles;
+        input_scale_cycles += scale_cycles;
+        input_convert_cycles += convert_cycles;
+        input_quant_cycles += static_cast<uint32_t>(
+            runtime_now_cycles() - started);
+#endif
+    }
+
+    __attribute__((always_inline)) inline void store_zero_blocks(
+        int tile,
+        int64_t first_block,
+        int64_t block_count
+    ) {
+        auto* quantized =
+            static_cast<int8_t*>(input_values.data()) +
+            static_cast<size_t>(tile) *
+                static_cast<size_t>(elements) +
+            static_cast<size_t>(first_block) *
+                kQ4BlockElements;
+        auto* scales =
+            static_cast<Q4Q8Scale*>(input_scales.data()) +
+            static_cast<size_t>(tile) *
+                static_cast<size_t>(blocks) +
+            static_cast<size_t>(first_block);
+#if INFLECT_PROFILE_VOCODER_OPS
+        const uint32_t started = runtime_now_cycles();
+        profiled_input_blocks +=
+            static_cast<uint64_t>(block_count);
+        profiled_zero_input_blocks +=
+            static_cast<uint64_t>(block_count);
+        profiled_input_values += static_cast<uint64_t>(
+            block_count * kQ4BlockElements);
+        profiled_zero_input_values += static_cast<uint64_t>(
+            block_count * kQ4BlockElements);
+#endif
+        runtime_store_zero_s8_blocks_32(
+            quantized,
+            static_cast<size_t>(block_count));
+        std::fill(
+            scales,
+            scales + block_count,
+            0.0f);
+#if INFLECT_PROFILE_VOCODER_OPS
+        input_quant_cycles += static_cast<uint32_t>(
+            runtime_now_cycles() - started);
+#endif
+    }
+
+    void unpack_weight(const void* row) {
+#if INFLECT_PROFILE_VOCODER_OPS
+        const uint32_t started = runtime_now_cycles();
+#endif
+        auto* values =
+            static_cast<int8_t*>(weight_values.data());
+        auto* scales =
+            static_cast<Q4Q8Scale*>(
+                weight_scales.data());
+        auto* scale_bits =
+            static_cast<uint16_t*>(
+                weight_scale_bits.data());
+        runtime_unpack_q4_0_blocks_32(
+            static_cast<const uint8_t*>(row),
+            sizeof(PackedQ4Block),
+            values,
+            scale_bits,
+            static_cast<size_t>(blocks));
+        for (int64_t block = 0; block < blocks; ++block) {
+            scales[block] =
+                cache_weight_scale(scale_bits[block]);
+        }
+#if INFLECT_PROFILE_VOCODER_OPS
+        q4_unpack_cycles += static_cast<uint32_t>(
+            runtime_now_cycles() - started);
+#endif
+    }
+
+    void calculate(int rows) {
+        if (runtime_has_s8_scaled_dot_blocks_32()) {
+#if INFLECT_PROFILE_VOCODER_OPS
+            uint64_t dot_cycles = 0;
+            uint64_t reduce_cycles = 0;
+            uint64_t* dot_cycles_ptr = &dot_cycles;
+            uint64_t* reduce_cycles_ptr = &reduce_cycles;
+#else
+            uint64_t* dot_cycles_ptr = nullptr;
+            uint64_t* reduce_cycles_ptr = nullptr;
+#endif
+            runtime_dot_s8_scaled_blocks_32(
+                static_cast<const int8_t*>(
+                    weight_values.data()),
+                static_cast<const Q4Q8Scale*>(
+                    weight_scales.data()),
+                static_cast<const int8_t*>(
+                    input_values.data()),
+                static_cast<const Q4Q8Scale*>(
+                    input_scales.data()),
+                static_cast<float*>(results.data()),
+                static_cast<size_t>(blocks),
+                static_cast<size_t>(rows),
+                dot_cycles_ptr,
+                reduce_cycles_ptr);
+#if INFLECT_PROFILE_VOCODER_OPS
+            s8_dot_cycles += dot_cycles;
+            scale_reduce_cycles += reduce_cycles;
+#endif
+            return;
+        }
+#if INFLECT_PROFILE_VOCODER_OPS
+        const uint32_t dot_started = runtime_now_cycles();
+#endif
+        runtime_dot_s8_blocks_32(
+            static_cast<const int8_t*>(
+                weight_values.data()),
+            static_cast<const int8_t*>(
+                input_values.data()),
+            static_cast<int32_t*>(sums.data()),
+            static_cast<size_t>(blocks),
+            static_cast<size_t>(rows));
+#if INFLECT_PROFILE_VOCODER_OPS
+        s8_dot_cycles += static_cast<uint32_t>(
+            runtime_now_cycles() - dot_started);
+        const uint32_t reduce_started = runtime_now_cycles();
+#endif
+        auto* output = static_cast<float*>(results.data());
+        const auto* products =
+            static_cast<const int32_t*>(sums.data());
+        const auto* input_scale =
+            static_cast<const Q4Q8Scale*>(
+                input_scales.data());
+        const auto* weight_scale =
+            static_cast<const Q4Q8Scale*>(
+                weight_scales.data());
+        for (int row = 0; row < rows; ++row) {
+            float result = 0.0f;
+            for (int64_t block = 0; block < blocks; ++block) {
+                const size_t index =
+                    static_cast<size_t>(row) *
+                        static_cast<size_t>(blocks) +
+                    static_cast<size_t>(block);
+                result +=
+                    static_cast<float>(products[index]) *
+                    read_cached_scale(weight_scale[block]) *
+                    read_cached_scale(input_scale[index]);
+            }
+            output[row] = result;
+        }
+#if INFLECT_PROFILE_VOCODER_OPS
+        scale_reduce_cycles += static_cast<uint32_t>(
+            runtime_now_cycles() - reduce_started);
+#endif
+    }
+
+    float value(int row) const {
+        return static_cast<const float*>(
+            results.data())[row];
+    }
+};
+
+struct Q8HotBlockWriter {
+    Q4Q8TileDot& dot;
+    int tile;
+    float* values;
+    bool skip_zero_blocks;
+    int64_t next_block = 0;
+    int fill = 0;
+
+    __attribute__((always_inline)) inline void flush() {
+        dot.quantize_blocks(
+            tile,
+            next_block,
+            values,
+            1,
+            skip_zero_blocks);
+        ++next_block;
+        fill = 0;
+    }
+
+    __attribute__((always_inline)) inline void append_zeros(
+        int64_t count
+    ) {
+        if (fill != 0) {
+            const int take = static_cast<int>(
+                std::min<int64_t>(
+                    kQ4BlockElements - fill, count));
+            std::fill(
+                values + fill,
+                values + fill + take,
+                0.0f);
+            fill += take;
+            count -= take;
+            if (fill == kQ4BlockElements) {
+                flush();
+            }
+        }
+        if (count >= kQ4BlockElements) {
+            const int64_t complete_blocks =
+                count / kQ4BlockElements;
+            dot.store_zero_blocks(
+                tile, next_block, complete_blocks);
+            next_block += complete_blocks;
+            count -= complete_blocks * kQ4BlockElements;
+        }
+        if (count > 0) {
+            std::fill(
+                values,
+                values + count,
+                0.0f);
+            fill = static_cast<int>(count);
+        }
+    }
+
+    __attribute__((always_inline)) inline void append_strided(
+        const char* source,
+        size_t stride,
+        int64_t count
+    ) {
+        while (count > 0) {
+            const int take = static_cast<int>(
+                std::min<int64_t>(
+                    kQ4BlockElements - fill, count));
+            for (int index = 0; index < take; ++index) {
+                values[fill + index] =
+                    *reinterpret_cast<const float*>(
+                        source +
+                        static_cast<size_t>(index) * stride);
+            }
+            source += static_cast<size_t>(take) * stride;
+            fill += take;
+            count -= take;
+            if (fill == kQ4BlockElements) {
+                flush();
+            }
+        }
+    }
+
+    __attribute__((always_inline)) inline bool complete() const {
+        return fill == 0 && next_block == dot.blocks;
+    }
+};
+
+struct PackedQuantDot {
+    const ggml_type_traits_cpu* weight_traits = nullptr;
+    const ggml_type_traits_cpu* input_traits = nullptr;
+    int64_t elements = 0;
+    size_t input_bytes = 0;
+};
+
+static bool prepare_packed_quant_dot(
+    const ggml_tensor* weight,
+    int64_t required_elements,
+    PackedQuantDot& packed
+) {
+    if (weight == nullptr || required_elements <= 0 ||
+        weight->ne[0] < required_elements) {
+        return false;
+    }
+    packed.weight_traits =
+        ggml_get_type_traits_cpu(weight->type);
+    if (packed.weight_traits == nullptr ||
+        packed.weight_traits->vec_dot == nullptr ||
+        packed.weight_traits->vec_dot_type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    packed.input_traits = ggml_get_type_traits_cpu(
+        packed.weight_traits->vec_dot_type);
+    if (packed.input_traits == nullptr ||
+        packed.input_traits->from_float == nullptr) {
+        return false;
+    }
+    const int64_t block_size = ggml_blck_size(
+        packed.weight_traits->vec_dot_type);
+    if (block_size <= 0 || weight->ne[0] % block_size != 0) {
+        return false;
+    }
+    packed.elements = weight->ne[0];
+    packed.input_bytes = ggml_row_size(
+        packed.weight_traits->vec_dot_type,
+        packed.elements);
+    return packed.input_bytes > 0;
+}
+
+static bool quant_conv1d_packed_op(
+    ggml_tensor* dst,
+    int ith,
+    int nth,
+    const VocoderQuantConv1dOpData* p,
+    const ggml_tensor* x,
+    const ggml_tensor* weight,
+    const ggml_tensor* bias
+) {
+    const int64_t T = dst->ne[0];
+    const int64_t out_ch = dst->ne[1];
+    const int64_t batch = dst->ne[2];
+    const int64_t in_ch = x->ne[1];
+    const int64_t flat =
+        static_cast<int64_t>(p->kernel_size) * in_ch;
+    PackedQuantDot packed;
+    if (!prepare_packed_quant_dot(weight, flat, packed)) {
+        return false;
+    }
+
+    VocoderInternalFloatScratch input_window;
+    VocoderInternalFloatScratch bias_values;
+    VocoderInternalByteScratch hot_input_block;
+    VocoderInternalByteScratch quantized_windows;
+    VocoderInternalByteScratch weight_row;
+    std::unique_ptr<Q4Q8TileDot> q4_dot;
+    const int time_tile = runtime_packed_quant_time_tile();
+    const bool use_q4_dot =
+        weight->type == GGML_TYPE_Q4_0 &&
+        runtime_has_s8_dot_blocks_32();
+    const size_t weight_row_bytes =
+        ggml_row_size(weight->type, packed.elements);
+    if (use_q4_dot) {
+        q4_dot.reset(new (std::nothrow) Q4Q8TileDot());
+    } else {
+        input_window.resize(static_cast<size_t>(packed.elements));
+    }
+    if (use_q4_dot
+            ? (q4_dot == nullptr ||
+               !q4_dot->init(
+                   packed.elements, time_tile) ||
+               !hot_input_block.try_resize(
+                   kQ4BlockElements * sizeof(float)))
+            : (!quantized_windows.try_resize(
+                   packed.input_bytes *
+                       static_cast<size_t>(time_tile)) ||
+               !weight_row.try_resize(
+                   weight_row_bytes))) {
+        return false;
+    }
+
+    // The Q4 path spends substantially more time gathering and quantizing
+    // input windows than it does in the packed dot product. Split time
+    // across workers so each window is quantized once globally. Other
+    // quantized formats retain the output-channel split used by ggml.
+    const int64_t time_start =
+        use_q4_dot ? (T * ith) / nth : 0;
+    const int64_t time_end =
+        use_q4_dot ? (T * (ith + 1)) / nth : T;
+    const int64_t out_start =
+        use_q4_dot ? 0 : (out_ch * ith) / nth;
+    const int64_t out_end =
+        use_q4_dot ? out_ch : (out_ch * (ith + 1)) / nth;
+    if (bias != nullptr) {
+        bias_values.resize(
+            static_cast<size_t>(out_end - out_start));
+        for (int64_t o = out_start; o < out_end; ++o) {
+            bias_values.data()[o - out_start] =
+                tensor_get_f32(bias, o, 0, 0);
+        }
+    }
+
+    const char* x_data = static_cast<const char*>(x->data);
+    char* dst_data = static_cast<char*>(dst->data);
+    float* window = use_q4_dot
+        ? static_cast<float*>(hot_input_block.data())
+        : input_window.data();
+#if INFLECT_PROFILE_VOCODER_OPS
+    uint64_t output_write_cycles = 0;
+#endif
+    for (int64_t b = 0; b < batch; ++b) {
+        for (int64_t tile_start = time_start;
+             tile_start < time_end;
+             tile_start += time_tile) {
+            const int tile_count = static_cast<int>(
+                std::min<int64_t>(
+                    time_tile, time_end - tile_start));
+            for (int tile = 0; tile < tile_count; ++tile) {
+                const int64_t t = tile_start + tile;
+                if (use_q4_dot) {
+#if INFLECT_PROFILE_VOCODER_OPS
+                    const uint64_t quant_cycles_before =
+                        q4_dot->input_quant_cycles;
+                    const uint32_t gather_started =
+                        runtime_now_cycles();
+#endif
+                    Q8HotBlockWriter writer{
+                        *q4_dot, tile, window, false};
+                    const int64_t first_source_t =
+                        t * p->stride - p->padding;
+                    const int valid_begin =
+                        first_source_t >= 0
+                            ? 0
+                            : static_cast<int>(
+                                  (-first_source_t +
+                                   p->dilation - 1) /
+                                  p->dilation);
+                    const int valid_end =
+                        first_source_t >= x->ne[0]
+                            ? 0
+                            : static_cast<int>(
+                                  (x->ne[0] - 1 -
+                                   first_source_t) /
+                                      p->dilation +
+                                  1);
+                    const int begin = std::max(
+                        0,
+                        std::min(
+                            p->kernel_size, valid_begin));
+                    const int end = std::max(
+                        begin,
+                        std::min(
+                            p->kernel_size, valid_end));
+                    for (int64_t channel = 0;
+                         channel < in_ch;
+                         ++channel) {
+                        writer.append_zeros(begin);
+                        if (end > begin) {
+                            const int64_t source_t =
+                                first_source_t +
+                                static_cast<int64_t>(begin) *
+                                    p->dilation;
+                            writer.append_strided(
+                                x_data +
+                                    source_t * x->nb[0] +
+                                    channel * x->nb[1] +
+                                    b * x->nb[2],
+                                static_cast<size_t>(
+                                    p->dilation) *
+                                    x->nb[0],
+                                end - begin);
+                        }
+                        writer.append_zeros(
+                            p->kernel_size - end);
+                    }
+                    writer.append_zeros(
+                        packed.elements - flat);
+                    if (!writer.complete()) {
+                        return false;
+                    }
+#if INFLECT_PROFILE_VOCODER_OPS
+                    const uint32_t gather_finished =
+                        runtime_now_cycles();
+                    const uint64_t quant_cycles =
+                        q4_dot->input_quant_cycles -
+                        quant_cycles_before;
+                    const uint64_t window_cycles =
+                        static_cast<uint32_t>(
+                            gather_finished - gather_started);
+                    q4_dot->input_gather_cycles +=
+                        window_cycles > quant_cycles
+                            ? window_cycles - quant_cycles
+                            : 0;
+#endif
+                } else {
+                    for (int64_t c = 0; c < in_ch; ++c) {
+                        float* dst_c =
+                            window + c * p->kernel_size;
+                        for (int64_t k = 0;
+                             k < p->kernel_size;
+                             ++k) {
+                            const int64_t src_t =
+                                t * p->stride +
+                                k * p->dilation -
+                                p->padding;
+                            if (src_t < 0 ||
+                                src_t >= x->ne[0]) {
+                                dst_c[k] = 0.0f;
+                            } else {
+                                const char* src =
+                                    x_data +
+                                    src_t * x->nb[0] +
+                                    c * x->nb[1] +
+                                    b * x->nb[2];
+                                dst_c[k] =
+                                    *reinterpret_cast<
+                                        const float*>(src);
+                            }
+                        }
+                    }
+                    std::fill(
+                        window + flat,
+                        window + packed.elements,
+                        0.0f);
+                    void* quantized =
+                        static_cast<char*>(
+                            quantized_windows.data()) +
+                        static_cast<size_t>(tile) *
+                            packed.input_bytes;
+                    packed.input_traits->from_float(
+                        window,
+                        quantized,
+                        packed.elements);
+                }
+            }
+
+            for (int64_t o = out_start; o < out_end; ++o) {
+                const char* source_weight =
+                    static_cast<const char*>(weight->data) +
+                    o * weight->nb[1];
+                if (use_q4_dot) {
+                    q4_dot->unpack_weight(source_weight);
+                    q4_dot->calculate(tile_count);
+                } else {
+                    std::memcpy(
+                        weight_row.data(),
+                        source_weight,
+                        weight_row_bytes);
+                }
+                for (int tile = 0;
+                     tile < tile_count;
+                     ++tile) {
+                    const int64_t t = tile_start + tile;
+                    float value;
+                    if (use_q4_dot) {
+                        value = q4_dot->value(tile);
+                    } else {
+                        const void* quantized =
+                            static_cast<const char*>(
+                                quantized_windows.data()) +
+                            static_cast<size_t>(tile) *
+                                packed.input_bytes;
+                        value = 0.0f;
+                        packed.weight_traits->vec_dot(
+                            static_cast<int>(
+                                packed.elements),
+                            &value,
+                            0,
+                            weight_row.data(),
+                            0,
+                            quantized,
+                            0,
+                            1);
+                    }
+                    if (bias != nullptr) {
+                        value +=
+                            bias_values.data()[
+                                o - out_start];
+                    }
+                    float* output = reinterpret_cast<float*>(
+                        dst_data +
+                        t * dst->nb[0] +
+                        o * dst->nb[1] +
+                        b * dst->nb[2]);
+#if INFLECT_PROFILE_VOCODER_OPS
+                    if (use_q4_dot) {
+                        const uint32_t write_started =
+                            runtime_now_cycles();
+                        *output = value;
+                        output_write_cycles +=
+                            static_cast<uint32_t>(
+                                runtime_now_cycles() -
+                                write_started);
+                    } else {
+                        *output = value;
+                    }
+#else
+                    *output = value;
+#endif
+                }
+            }
+            runtime_cooperate();
+        }
+    }
+#if INFLECT_PROFILE_VOCODER_OPS
+    if (use_q4_dot) {
+        vocode_profile_add_packed(
+            q4_dot->input_gather_cycles,
+            q4_dot->input_quant_cycles,
+            q4_dot->input_max_cycles,
+            q4_dot->input_scale_cycles,
+            q4_dot->input_convert_cycles,
+            q4_dot->q4_unpack_cycles,
+            q4_dot->s8_dot_cycles,
+            q4_dot->scale_reduce_cycles,
+            output_write_cycles);
+        vocode_profile_add_input_sparsity(
+            p->profile_label,
+            q4_dot->profiled_input_blocks,
+            q4_dot->profiled_zero_input_blocks,
+            q4_dot->profiled_input_values,
+            q4_dot->profiled_zero_input_values);
+    }
+#endif
+    return true;
+}
+#endif
+
+static bool quant_conv1d_resblock_im2col_op(
     ggml_tensor* dst,
     int ith,
     int nth,
@@ -324,29 +1270,55 @@ static void quant_conv1d_resblock_im2col_op(
     const int64_t batch = dst->ne[2];
     const int64_t in_ch = x->ne[1];
     const int64_t flat = (int64_t)p->kernel_size * in_ch;
+#if defined(INFLECT_LOW_MEMORY)
+    const int64_t out_start = (out_ch * ith) / nth;
+    const int64_t out_end = (out_ch * (ith + 1)) / nth;
+#else
+    const int64_t out_start = 0;
+    const int64_t out_end = out_ch;
+#endif
 
-    FloatScratch weight_rows;
-    InternalFloatScratch input_window;
-    FloatScratch bias_values;
-    weight_rows.resize((size_t)weight->ne[0] * (size_t)out_ch);
+    VocoderFloatScratch weight_rows;
+    VocoderInternalFloatScratch input_window;
+    VocoderFloatScratch bias_values;
+    const size_t weight_count =
+        static_cast<size_t>(weight->ne[0]) *
+        static_cast<size_t>(out_end - out_start);
+#if defined(INFLECT_LOW_MEMORY)
+    if (!weight_rows.try_resize(weight_count)) {
+        return false;
+    }
+#else
+    weight_rows.resize(weight_count);
+#endif
     input_window.resize((size_t)flat);
     if (bias != nullptr) {
-        bias_values.resize((size_t)out_ch);
+        bias_values.resize((size_t)(out_end - out_start));
     }
 
     float* weights_f = weight_rows.data();
-    for (int64_t o = 0; o < out_ch; o++) {
+    for (int64_t o = out_start; o < out_end; o++) {
+        const int64_t local_o = o - out_start;
         const char* row_ptr = static_cast<const char*>(weight->data) + o * weight->nb[1];
-        traits->to_float(row_ptr, weights_f + o * weight->ne[0], weight->ne[0]);
+        traits->to_float(
+            row_ptr,
+            weights_f + local_o * weight->ne[0],
+            weight->ne[0]);
         if (bias != nullptr) {
-            bias_values.data()[o] = tensor_get_f32(bias, o, 0, 0);
+            bias_values.data()[local_o] =
+                tensor_get_f32(bias, o, 0, 0);
         }
     }
 
     const char* x_data = static_cast<const char*>(x->data);
     char* dst_data = static_cast<char*>(dst->data);
+#if defined(INFLECT_LOW_MEMORY)
+    const int64_t t_start = 0;
+    const int64_t t_end = T;
+#else
     const int64_t t_start = (T * ith) / nth;
     const int64_t t_end = (T * (ith + 1)) / nth;
+#endif
 
     for (int64_t b = 0; b < batch; b++) {
         for (int64_t t = t_start; t < t_end; t++) {
@@ -364,14 +1336,24 @@ static void quant_conv1d_resblock_im2col_op(
                 }
             }
 
-            for (int64_t o = 0; o < out_ch; o++) {
-                const float* w_row = weights_f + o * weight->ne[0];
-                const float v = (bias != nullptr ? bias_values.data()[o] : 0.0f) +
-                                dot_f32_strided(window, 1, w_row, 1, (int)flat);
+            for (int64_t o = out_start; o < out_end; o++) {
+                const int64_t local_o = o - out_start;
+                const float* w_row =
+                    weights_f + local_o * weight->ne[0];
+                const float v =
+                    (bias != nullptr
+                         ? bias_values.data()[local_o]
+                         : 0.0f) +
+                    dot_f32_strided(
+                        window, 1, w_row, 1, (int)flat);
                 *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
             }
+#if defined(INFLECT_LOW_MEMORY)
+            runtime_cooperate();
+#endif
         }
     }
+    return true;
 }
 
 static void quant_conv1d_op(
@@ -402,19 +1384,57 @@ static void quant_conv1d_op(
         std::abort();
     }
 
-#if INFLECT_USE_RESBLOCK_IM2COL
-    if (p->stride == 1 && is_resblock_conv_label(p->profile_label)) {
-        quant_conv1d_resblock_im2col_op(dst, ith, nth, p, x, weight, bias, traits);
-        const uint64_t t_start = (uint64_t)((T * ith) / nth);
-        const uint64_t t_end = (uint64_t)((T * (ith + 1)) / nth);
-        const uint64_t outputs = (t_end - t_start) * (uint64_t)out_ch * (uint64_t)batch;
-        const uint64_t macs = outputs * (uint64_t)p->kernel_size * (uint64_t)in_ch;
-        vocode_profile_add_conv1d(p->profile_label, now_ms() - op_start_ms, outputs, macs);
+#if defined(INFLECT_LOW_MEMORY)
+    if (quant_conv1d_packed_op(
+            dst, ith, nth, p, x, weight, bias)) {
+        const uint64_t out_start =
+            (static_cast<uint64_t>(out_ch) * ith) / nth;
+        const uint64_t out_end =
+            (static_cast<uint64_t>(out_ch) * (ith + 1)) / nth;
+        const uint64_t outputs =
+            static_cast<uint64_t>(T) *
+            (out_end - out_start) *
+            static_cast<uint64_t>(batch);
+        const uint64_t macs =
+            outputs *
+            static_cast<uint64_t>(p->kernel_size) *
+            static_cast<uint64_t>(in_ch);
+        vocode_profile_add_conv1d(
+            p->profile_label,
+            now_ms() - op_start_ms,
+            outputs,
+            macs);
         return;
     }
 #endif
 
-    thread_local FloatScratch weight_row;
+    if (p->stride == 1 && is_resblock_conv_label(p->profile_label)) {
+        if (quant_conv1d_resblock_im2col_op(
+                dst, ith, nth, p, x, weight, bias, traits)) {
+#if defined(INFLECT_LOW_MEMORY)
+            const uint64_t out_start =
+                (static_cast<uint64_t>(out_ch) * ith) / nth;
+            const uint64_t out_end =
+                (static_cast<uint64_t>(out_ch) * (ith + 1)) / nth;
+            const uint64_t outputs =
+                static_cast<uint64_t>(T) *
+                (out_end - out_start) *
+                static_cast<uint64_t>(batch);
+#else
+            const uint64_t t_start = (uint64_t)((T * ith) / nth);
+            const uint64_t t_end = (uint64_t)((T * (ith + 1)) / nth);
+            const uint64_t outputs =
+                (t_end - t_start) * (uint64_t)out_ch * (uint64_t)batch;
+#endif
+            const uint64_t macs =
+                outputs * (uint64_t)p->kernel_size * (uint64_t)in_ch;
+            vocode_profile_add_conv1d(
+                p->profile_label, now_ms() - op_start_ms, outputs, macs);
+            return;
+        }
+    }
+
+    thread_local VocoderFloatScratch weight_row;
     weight_row.resize(weight->ne[0]);
 
     const char* x_data = static_cast<const char*>(x->data);
@@ -442,6 +1462,9 @@ static void quant_conv1d_op(
                                          (int)in_ch);
                 }
                 *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
+#if defined(INFLECT_LOW_MEMORY)
+                runtime_cooperate();
+#endif
             }
         }
     }
@@ -598,6 +1621,7 @@ static ggml_tensor* conv1d_vocoder(
     }
 
 #if defined(INFLECT_LOW_MEMORY)
+    (void)apply_optional_biases;
     const int64_t out_t = (x->ne[0] + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
     op_data.push_back({profile_label, kernel_size, stride, padding, dilation});
     ggml_tensor* args[] = {x, weight, bias};
@@ -624,6 +1648,268 @@ static ggml_tensor* conv1d_vocoder(
 #endif
 }
 
+#if defined(INFLECT_LOW_MEMORY)
+static bool quant_conv_transpose1d_packed_op(
+    ggml_tensor* dst,
+    int ith,
+    int nth,
+    const QuantConvTranspose1dOpData* p,
+    const ggml_tensor* x,
+    const ggml_tensor* weight
+) {
+    const int64_t out_t = dst->ne[0];
+    const int64_t out_ch = dst->ne[1];
+    const int64_t batch = dst->ne[2];
+    const int64_t in_t = x->ne[0];
+    const int64_t in_ch = x->ne[1];
+    const int64_t flat =
+        static_cast<int64_t>(p->kernel_size) * in_ch;
+    PackedQuantDot packed;
+    if (!prepare_packed_quant_dot(weight, flat, packed)) {
+        return false;
+    }
+
+    VocoderInternalFloatScratch input_window;
+    VocoderInternalByteScratch hot_input_block;
+    VocoderInternalByteScratch quantized_windows;
+    VocoderInternalByteScratch weight_row;
+    std::unique_ptr<Q4Q8TileDot> q4_dot;
+    const int time_tile = runtime_packed_quant_time_tile();
+    const bool use_q4_dot =
+        weight->type == GGML_TYPE_Q4_0 &&
+        runtime_has_s8_dot_blocks_32();
+    const size_t weight_row_bytes =
+        ggml_row_size(weight->type, packed.elements);
+    if (use_q4_dot) {
+        q4_dot.reset(new (std::nothrow) Q4Q8TileDot());
+    } else {
+        input_window.resize(static_cast<size_t>(packed.elements));
+    }
+    if (use_q4_dot
+            ? (q4_dot == nullptr ||
+               !q4_dot->init(
+                   packed.elements, time_tile) ||
+               !hot_input_block.try_resize(
+                   kQ4BlockElements * sizeof(float)))
+            : (!quantized_windows.try_resize(
+                   packed.input_bytes *
+                       static_cast<size_t>(time_tile)) ||
+               !weight_row.try_resize(
+                   weight_row_bytes))) {
+        return false;
+    }
+
+    // Match the Conv1d Q4 scheduling: each temporal window is gathered and
+    // quantized by only one worker, while every output remains independent.
+    const int64_t time_start =
+        use_q4_dot ? (out_t * ith) / nth : 0;
+    const int64_t time_end =
+        use_q4_dot ? (out_t * (ith + 1)) / nth : out_t;
+    const int64_t out_start =
+        use_q4_dot ? 0 : (out_ch * ith) / nth;
+    const int64_t out_end =
+        use_q4_dot ? out_ch : (out_ch * (ith + 1)) / nth;
+    const char* x_data = static_cast<const char*>(x->data);
+    char* dst_data = static_cast<char*>(dst->data);
+    float* window = use_q4_dot
+        ? static_cast<float*>(hot_input_block.data())
+        : input_window.data();
+#if INFLECT_PROFILE_VOCODER_OPS
+    uint64_t output_write_cycles = 0;
+#endif
+
+    for (int64_t b = 0; b < batch; ++b) {
+        for (int64_t tile_start = time_start;
+             tile_start < time_end;
+             tile_start += time_tile) {
+            const int tile_count = static_cast<int>(
+                std::min<int64_t>(
+                    time_tile, time_end - tile_start));
+            for (int tile = 0; tile < tile_count; ++tile) {
+                const int64_t t = tile_start + tile;
+                const int64_t full_t =
+                    t + p->crop_left;
+                if (use_q4_dot) {
+#if INFLECT_PROFILE_VOCODER_OPS
+                    const uint64_t quant_cycles_before =
+                        q4_dot->input_quant_cycles;
+                    const uint32_t gather_started =
+                        runtime_now_cycles();
+#endif
+                    Q8HotBlockWriter writer{
+                        *q4_dot, tile, window, true};
+                    for (int kernel = 0;
+                         kernel < p->kernel_size;
+                         ++kernel) {
+                        const int64_t source_numerator =
+                            full_t - kernel;
+                        const bool tap_aligned =
+                            source_numerator >= 0 &&
+                            source_numerator % p->stride == 0;
+                        const int64_t source_t =
+                            tap_aligned
+                                ? source_numerator / p->stride
+                                : -1;
+                        if (source_t >= 0 &&
+                            source_t < in_t) {
+                            writer.append_strided(
+                                x_data +
+                                    source_t * x->nb[0] +
+                                    b * x->nb[2],
+                                x->nb[1],
+                                in_ch);
+                        } else {
+                            writer.append_zeros(in_ch);
+                        }
+                    }
+                    writer.append_zeros(
+                        packed.elements - flat);
+                    if (!writer.complete()) {
+                        return false;
+                    }
+#if INFLECT_PROFILE_VOCODER_OPS
+                    const uint32_t gather_finished =
+                        runtime_now_cycles();
+                    const uint64_t quant_cycles =
+                        q4_dot->input_quant_cycles -
+                        quant_cycles_before;
+                    const uint64_t window_cycles =
+                        static_cast<uint32_t>(
+                            gather_finished - gather_started);
+                    q4_dot->input_gather_cycles +=
+                        window_cycles > quant_cycles
+                            ? window_cycles - quant_cycles
+                            : 0;
+#endif
+                } else {
+                    std::fill(
+                        window,
+                        window + packed.elements,
+                        0.0f);
+                    for (int64_t k = full_t % p->stride;
+                         k < p->kernel_size;
+                         k += p->stride) {
+                        if (k > full_t) {
+                            break;
+                        }
+                        const int64_t src_t_full =
+                            (full_t - k) / p->stride;
+                        if (src_t_full < 0 ||
+                            src_t_full >= in_t) {
+                            continue;
+                        }
+                        for (int64_t c = 0;
+                             c < in_ch;
+                             ++c) {
+                            const char* src =
+                                x_data +
+                                src_t_full * x->nb[0] +
+                                c * x->nb[1] +
+                                b * x->nb[2];
+                            window[k * in_ch + c] =
+                                *reinterpret_cast<
+                                    const float*>(src);
+                        }
+                    }
+                    void* quantized =
+                        static_cast<char*>(
+                            quantized_windows.data()) +
+                        static_cast<size_t>(tile) *
+                            packed.input_bytes;
+                    packed.input_traits->from_float(
+                        window,
+                        quantized,
+                        packed.elements);
+                }
+            }
+
+            for (int64_t o = out_start; o < out_end; ++o) {
+                const char* source_weight =
+                    static_cast<const char*>(weight->data) +
+                    o * weight->nb[1];
+                if (use_q4_dot) {
+                    q4_dot->unpack_weight(source_weight);
+                    q4_dot->calculate(tile_count);
+                } else {
+                    std::memcpy(
+                        weight_row.data(),
+                        source_weight,
+                        weight_row_bytes);
+                }
+                for (int tile = 0;
+                     tile < tile_count;
+                     ++tile) {
+                    const int64_t t = tile_start + tile;
+                    float value;
+                    if (use_q4_dot) {
+                        value = q4_dot->value(tile);
+                    } else {
+                        const void* quantized =
+                            static_cast<const char*>(
+                                quantized_windows.data()) +
+                            static_cast<size_t>(tile) *
+                                packed.input_bytes;
+                        value = 0.0f;
+                        packed.weight_traits->vec_dot(
+                            static_cast<int>(
+                                packed.elements),
+                            &value,
+                            0,
+                            weight_row.data(),
+                            0,
+                            quantized,
+                            0,
+                            1);
+                    }
+                    float* output = reinterpret_cast<float*>(
+                        dst_data +
+                        t * dst->nb[0] +
+                        o * dst->nb[1] +
+                        b * dst->nb[2]);
+#if INFLECT_PROFILE_VOCODER_OPS
+                    if (use_q4_dot) {
+                        const uint32_t write_started =
+                            runtime_now_cycles();
+                        *output = value;
+                        output_write_cycles +=
+                            static_cast<uint32_t>(
+                                runtime_now_cycles() -
+                                write_started);
+                    } else {
+                        *output = value;
+                    }
+#else
+                    *output = value;
+#endif
+                }
+            }
+            runtime_cooperate();
+        }
+    }
+#if INFLECT_PROFILE_VOCODER_OPS
+    if (use_q4_dot) {
+        vocode_profile_add_packed(
+            q4_dot->input_gather_cycles,
+            q4_dot->input_quant_cycles,
+            q4_dot->input_max_cycles,
+            q4_dot->input_scale_cycles,
+            q4_dot->input_convert_cycles,
+            q4_dot->q4_unpack_cycles,
+            q4_dot->s8_dot_cycles,
+            q4_dot->scale_reduce_cycles,
+            output_write_cycles);
+        vocode_profile_add_input_sparsity(
+            p->profile_label,
+            q4_dot->profiled_input_blocks,
+            q4_dot->profiled_zero_input_blocks,
+            q4_dot->profiled_input_values,
+            q4_dot->profiled_zero_input_values);
+    }
+#endif
+    return true;
+}
+#endif
+
 static void quant_conv_transpose1d_op(
     ggml_tensor* dst,
     int ith,
@@ -645,6 +1931,34 @@ static void quant_conv_transpose1d_op(
     const int64_t in_t = x->ne[0];
     const int64_t in_ch = x->ne[1];
 
+#if defined(INFLECT_LOW_MEMORY)
+    if (quant_conv_transpose1d_packed_op(
+            dst, ith, nth, p, x, weight)) {
+        const uint64_t out_start =
+            (static_cast<uint64_t>(out_ch) * ith) / nth;
+        const uint64_t out_end =
+            (static_cast<uint64_t>(out_ch) * (ith + 1)) / nth;
+        const uint64_t outputs =
+            (out_end - out_start) *
+            static_cast<uint64_t>(out_t) *
+            static_cast<uint64_t>(batch);
+        const uint64_t taps_per_output =
+            static_cast<uint64_t>(
+                (p->kernel_size + p->stride - 1) /
+                p->stride);
+        const uint64_t macs =
+            outputs *
+            taps_per_output *
+            static_cast<uint64_t>(in_ch);
+        vocode_profile_add_conv_transpose(
+            p->profile_label,
+            now_ms() - op_start_ms,
+            outputs,
+            macs);
+        return;
+    }
+#endif
+
     const auto* traits = ggml_get_type_traits(weight->type);
     if (!traits || !traits->to_float) {
         fprintf(stderr, "[VocoderModel] unsupported quantized conv_transpose1d weight type %s\n",
@@ -652,7 +1966,7 @@ static void quant_conv_transpose1d_op(
         std::abort();
     }
 
-    thread_local FloatScratch weight_row;
+    thread_local VocoderFloatScratch weight_row;
     weight_row.resize(weight->ne[0]);
 
     const char* x_data = static_cast<const char*>(x->data);
@@ -683,6 +1997,9 @@ static void quant_conv_transpose1d_op(
                                          (int)in_ch);
                 }
                 *reinterpret_cast<float*>(dst_data + t * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2]) = v;
+#if defined(INFLECT_LOW_MEMORY)
+                runtime_cooperate();
+#endif
             }
         }
     }
@@ -931,6 +2248,99 @@ bool VocoderModel::load(ModelLoader& loader) {
     return true;
 }
 
+#if defined(INFLECT_LOW_MEMORY)
+bool VocoderModel::load_pre_stage(ModelLoader& loader) {
+    const std::string root =
+        config_.tensor_prefix.empty()
+            ? std::string()
+            : config_.tensor_prefix + ".";
+    weights_.conv_pre_w =
+        loader.get_tensor(root + "conv_pre.weight");
+    weights_.conv_pre_b =
+        loader.has_tensor(root + "conv_pre.bias")
+            ? loader.get_tensor(root + "conv_pre.bias")
+            : nullptr;
+    wctx_ = loader.ctx();
+    return weights_.conv_pre_w != nullptr;
+}
+
+bool VocoderModel::load_upsample_stage(
+    ModelLoader& loader,
+    int stage
+) {
+    const int n_ups =
+        static_cast<int>(config_.upsample_rates.size());
+    const int n_res =
+        static_cast<int>(config_.resblock_kernel_sizes.size());
+    if (stage < 0 || stage >= n_ups) {
+        return false;
+    }
+
+    const std::string root =
+        config_.tensor_prefix.empty()
+            ? std::string()
+            : config_.tensor_prefix + ".";
+    const std::string up =
+        root + "ups." + std::to_string(stage);
+    weights_.ups_w[stage] =
+        loader.get_tensor(up + ".weight");
+    weights_.ups_b[stage] =
+        loader.has_tensor(up + ".bias")
+            ? loader.get_tensor(up + ".bias")
+            : nullptr;
+    bool ok = weights_.ups_w[stage] != nullptr;
+
+    for (int branch = 0; branch < n_res; ++branch) {
+        const int rb_index = stage * n_res + branch;
+        ResBlockWeights& rb = weights_.resblocks[rb_index];
+        rb = {};
+        for (int depth = 0; depth < 3; ++depth) {
+            const std::string base =
+                root + "resblocks." + std::to_string(rb_index);
+            const std::string conv1 =
+                base + ".convs1." + std::to_string(depth);
+            const std::string conv2 =
+                base + ".convs2." + std::to_string(depth);
+            ggml_tensor* conv1_weight =
+                loader.get_tensor(conv1 + ".weight");
+            ggml_tensor* conv2_weight =
+                loader.get_tensor(conv2 + ".weight");
+            rb.convs1_w.push_back(conv1_weight);
+            rb.convs1_b.push_back(
+                loader.has_tensor(conv1 + ".bias")
+                    ? loader.get_tensor(conv1 + ".bias")
+                    : nullptr);
+            rb.convs2_w.push_back(conv2_weight);
+            rb.convs2_b.push_back(
+                loader.has_tensor(conv2 + ".bias")
+                    ? loader.get_tensor(conv2 + ".bias")
+                    : nullptr);
+            rb.acts1_alpha.push_back(nullptr);
+            rb.acts2_alpha.push_back(nullptr);
+            ok = ok && conv1_weight != nullptr &&
+                 conv2_weight != nullptr;
+        }
+    }
+    wctx_ = loader.ctx();
+    return ok;
+}
+
+bool VocoderModel::load_post_stage(ModelLoader& loader) {
+    const std::string root =
+        config_.tensor_prefix.empty()
+            ? std::string()
+            : config_.tensor_prefix + ".";
+    weights_.conv_post_w =
+        loader.get_tensor(root + "conv_post.weight");
+    weights_.conv_post_b =
+        loader.has_tensor(root + "conv_post.bias")
+            ? loader.get_tensor(root + "conv_post.bias")
+            : nullptr;
+    wctx_ = loader.ctx();
+    return weights_.conv_post_w != nullptr;
+}
+#endif
+
 // ═════════════════════════════════════════════════════════════════════════
 // Snake activation: x + sin²(α·x) / α
 // ═════════════════════════════════════════════════════════════════════════
@@ -1024,13 +2434,23 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     (void)init_ch;
 
     fprintf(stderr,
-            "[VocoderModel] resblocks=%d/%d depth=%d/3 residual_convs=%d/%d im2col=%d\n",
+            "[VocoderModel] resblocks=%d/%d depth=%d/3 "
+            "residual_convs=%d/%d im2col=%d"
+#if defined(INFLECT_LOW_MEMORY)
+            " packed_quant_dot=%d s8_dot=%d"
+#endif
+            "\n",
             active_res,
             n_res,
             active_depth,
             n_ups * active_res * active_depth * 2,
             n_ups * n_res * 3 * 2,
-            INFLECT_USE_RESBLOCK_IM2COL);
+            1
+#if defined(INFLECT_LOW_MEMORY)
+            , 1
+            , runtime_has_s8_dot_blocks_32() ? 1 : 0
+#endif
+    );
 
     const bool capture_debug = !debug_dump_dir().empty();
     std::vector<ggml_tensor*> debug_outputs;
@@ -1116,6 +2536,545 @@ ggml_cgraph* VocoderModel::build_vocoder_graph(
     return graph;
 }
 
+#if defined(INFLECT_LOW_MEMORY)
+static std::vector<float> execute_vocoder_stage_graph(
+    ggml_context* gctx,
+    ggml_cgraph* graph,
+    ggml_tensor* input,
+    const float* input_data,
+    size_t input_bytes,
+    std::vector<float>* consumed_input,
+    ggml_tensor* output,
+    ggml_backend_t backend,
+    const char* label,
+    bool log_completion
+) {
+    const uint32_t started_at = now_ms();
+    ggml_gallocr_t allocr =
+        ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+    if (!reserve_and_alloc_graph(allocr, graph)) {
+        ggml_gallocr_free(allocr);
+        return {};
+    }
+    mem_trace_graph(label, gctx, allocr);
+    mem_trace_top_graph_tensors(label, graph);
+    ggml_backend_tensor_set(
+        input, input_data, 0, input_bytes);
+    if (consumed_input != nullptr) {
+        std::vector<float>().swap(*consumed_input);
+        mem_release_to_os();
+    }
+    const ggml_status status =
+        ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        std::fprintf(
+            stderr,
+            "[VocoderModel] staged %s computation failed\n",
+            label);
+        ggml_gallocr_free(allocr);
+        return {};
+    }
+
+    std::vector<float> result(
+        static_cast<size_t>(ggml_nelements(output)));
+    ggml_backend_tensor_get(
+        output,
+        result.data(),
+        0,
+        ggml_nbytes(output));
+    ggml_gallocr_free(allocr);
+    mem_release_to_os();
+    if (log_completion) {
+        std::fprintf(
+            stderr,
+            "[VocoderModel] staged %s complete "
+            "values=%zu elapsed_ms=%u\n",
+            label,
+            result.size(),
+            static_cast<unsigned>(now_ms() - started_at));
+    }
+    return result;
+}
+
+static ggml_context* new_vocoder_stage_context() {
+    struct ggml_init_params params = {
+        .mem_size = 96 * 1024,
+        .mem_buffer = nullptr,
+        .no_alloc = true,
+    };
+    return ggml_init(params);
+}
+
+std::vector<float> VocoderModel::run_pre_stage(
+    const std::vector<float>& mel,
+    int n_mels,
+    int n_frames,
+    ggml_backend_t backend
+) {
+    if (weights_.conv_pre_w == nullptr ||
+        n_mels <= 0 || n_frames <= 0 ||
+        mel.size() !=
+            static_cast<size_t>(n_mels) * n_frames) {
+        return {};
+    }
+    ggml_context* gctx = new_vocoder_stage_context();
+    if (gctx == nullptr) {
+        return {};
+    }
+    quant_conv1d_ops_.clear();
+    quant_conv1d_ops_.reserve(1);
+    quant_conv_transpose_ops_.clear();
+
+    ggml_tensor* input = ggml_new_tensor_3d(
+        gctx, GGML_TYPE_F32, n_mels, n_frames, 1);
+    ggml_tensor* x =
+        ggml_cont(gctx, ggml_permute(
+            gctx, input, 1, 0, 2, 3));
+    x = conv1d_vocoder(
+        gctx,
+        weights_.conv_pre_w,
+        weights_.conv_pre_b,
+        x,
+        7,
+        1,
+        3,
+        1,
+        config_.optional_biases,
+        quant_conv1d_ops_,
+        "conv_pre");
+    ggml_set_name(x, "vocoder_staged_pre");
+    ggml_set_output(x);
+    ggml_cgraph* graph =
+        ggml_new_graph_custom(gctx, 128, false);
+    ggml_build_forward_expand(graph, x);
+    std::vector<float> output =
+        execute_vocoder_stage_graph(
+            gctx,
+            graph,
+            input,
+            mel.data(),
+            mel.size() * sizeof(float),
+            nullptr,
+            x,
+            backend,
+            "pre",
+            true);
+    ggml_free(gctx);
+    mem_release_to_os();
+    return output;
+}
+
+std::vector<float> VocoderModel::run_upsample_stage(
+    std::vector<float>& input_data,
+    int input_frames,
+    int stage,
+    ggml_backend_t backend
+) {
+    const int n_ups =
+        static_cast<int>(config_.upsample_rates.size());
+    const int n_res =
+        static_cast<int>(config_.resblock_kernel_sizes.size());
+    if (stage < 0 || stage >= n_ups ||
+        input_frames <= 0) {
+        return {};
+    }
+
+    int full_stage_limit = 48;
+    for (int prior = 0; prior < stage; ++prior) {
+        full_stage_limit *= config_.upsample_rates[prior];
+    }
+    if (input_frames <= full_stage_limit) {
+        return run_upsample_stage_once(
+            input_data,
+            input_frames,
+            stage,
+            backend,
+            true);
+    }
+
+    static constexpr int core_frames[] = {
+        32, 64, 128, 256,
+    };
+    int output_radius = 0;
+    for (int branch = 0; branch < std::min(n_res, 3);
+         ++branch) {
+        const int kernel =
+            config_.resblock_kernel_sizes[branch];
+        int branch_radius = 0;
+        for (int depth = 0; depth < 3; ++depth) {
+            const auto& dilations =
+                config_.resblock_dilation_sizes[
+                    depth %
+                    config_.resblock_dilation_sizes.size()];
+            const int dilation = dilations[depth];
+            branch_radius +=
+                ((kernel - 1) / 2) * (dilation + 1);
+        }
+        output_radius =
+            std::max(output_radius, branch_radius);
+    }
+
+    const int rate = config_.upsample_rates[stage];
+    const int kernel =
+        config_.upsample_kernel_sizes[stage];
+    const int input_halo =
+        (output_radius + kernel + rate - 1) / rate + 1;
+    const int input_channels =
+        config_.upsample_initial_channel >> stage;
+    const int output_channels =
+        config_.upsample_initial_channel >> (stage + 1);
+    const int output_frames = input_frames * rate;
+    std::vector<float> output(
+        static_cast<size_t>(output_frames) *
+        output_channels);
+    std::vector<float> input_chunk;
+    const uint32_t started_at = now_ms();
+    int chunk_count = 0;
+
+    for (int core_start = 0; core_start < input_frames;
+         core_start += core_frames[stage]) {
+        const int core_end =
+            std::min(
+                input_frames,
+                core_start + core_frames[stage]);
+        const int input_start =
+            std::max(0, core_start - input_halo);
+        const int input_end =
+            std::min(
+                input_frames,
+                core_end + input_halo);
+        const int chunk_input_frames =
+            input_end - input_start;
+        input_chunk.resize(
+            static_cast<size_t>(chunk_input_frames) *
+            input_channels);
+        for (int channel = 0;
+             channel < input_channels;
+             ++channel) {
+            std::copy_n(
+                input_data.data() +
+                    static_cast<size_t>(channel) *
+                        input_frames +
+                    input_start,
+                chunk_input_frames,
+                input_chunk.data() +
+                    static_cast<size_t>(channel) *
+                        chunk_input_frames);
+        }
+
+        std::vector<float> chunk_output =
+            run_upsample_stage_once(
+                input_chunk,
+                chunk_input_frames,
+                stage,
+                backend,
+                false);
+        const int chunk_output_frames =
+            chunk_input_frames * rate;
+        const int keep_start =
+            (core_start - input_start) * rate;
+        const int keep_frames =
+            (core_end - core_start) * rate;
+        if (chunk_output.size() !=
+            static_cast<size_t>(chunk_output_frames) *
+                output_channels) {
+            return {};
+        }
+        for (int channel = 0;
+             channel < output_channels;
+             ++channel) {
+            std::copy_n(
+                chunk_output.data() +
+                    static_cast<size_t>(channel) *
+                        chunk_output_frames +
+                    keep_start,
+                keep_frames,
+                output.data() +
+                    static_cast<size_t>(channel) *
+                        output_frames +
+                    core_start * rate);
+        }
+        ++chunk_count;
+    }
+    std::vector<float>().swap(input_data);
+    mem_release_to_os();
+    std::fprintf(
+        stderr,
+        "[VocoderModel] staged upsample_%d complete "
+        "values=%zu chunks=%d elapsed_ms=%u\n",
+        stage,
+        output.size(),
+        chunk_count,
+        static_cast<unsigned>(now_ms() - started_at));
+    return output;
+}
+
+std::vector<float> VocoderModel::run_upsample_stage_once(
+    std::vector<float>& input_data,
+    int input_frames,
+    int stage,
+    ggml_backend_t backend,
+    bool log_completion
+) {
+    const int n_ups =
+        static_cast<int>(config_.upsample_rates.size());
+    const int n_res =
+        static_cast<int>(config_.resblock_kernel_sizes.size());
+    if (stage < 0 || stage >= n_ups ||
+        input_frames <= 0) {
+        return {};
+    }
+    const int input_channels =
+        config_.upsample_initial_channel >> stage;
+    const int output_channels =
+        config_.upsample_initial_channel >> (stage + 1);
+    if (input_channels <= 0 || output_channels <= 0 ||
+        input_data.size() !=
+            static_cast<size_t>(input_frames) *
+                input_channels ||
+        weights_.ups_w[stage] == nullptr) {
+        return {};
+    }
+
+    ggml_context* gctx = new_vocoder_stage_context();
+    if (gctx == nullptr) {
+        return {};
+    }
+    constexpr int active_depth = 3;
+    const int active_res = std::min(n_res, 3);
+    quant_conv1d_ops_.clear();
+    quant_conv1d_ops_.reserve(
+        static_cast<size_t>(active_res) *
+        active_depth * 2);
+    quant_conv_transpose_ops_.clear();
+    quant_conv_transpose_ops_.reserve(1);
+
+    ggml_tensor* input = ggml_new_tensor_3d(
+        gctx,
+        GGML_TYPE_F32,
+        input_frames,
+        input_channels,
+        1);
+    ggml_tensor* x =
+        ggml_leaky_relu(gctx, input, 0.1f, true);
+    const int rate = config_.upsample_rates[stage];
+    const int kernel = config_.upsample_kernel_sizes[stage];
+    const int crop = (kernel - rate) / 2;
+    x = quant_or_f16_conv_transpose_1d(
+        gctx,
+        weights_.ups_w[stage],
+        x,
+        kernel,
+        rate,
+        crop,
+        quant_conv_transpose_ops_,
+        "upsample");
+    if (config_.optional_biases &&
+        weights_.ups_b[stage] != nullptr) {
+        x = add_channel_bias(
+            gctx, x, weights_.ups_b[stage]);
+    }
+
+    ggml_tensor* sum = nullptr;
+    for (int branch = 0; branch < active_res; ++branch) {
+        const int rb_index = stage * n_res + branch;
+        ggml_tensor* branch_output = build_resblock(
+            gctx,
+            x,
+            weights_.resblocks[rb_index],
+            config_.resblock_kernel_sizes[branch],
+            active_depth);
+        sum = sum == nullptr
+                  ? branch_output
+                  : ggml_add_inplace(
+                        gctx, sum, branch_output);
+    }
+    x = ggml_scale_inplace(
+        gctx, sum, 1.0f / active_res);
+    ggml_set_name(x, "vocoder_staged_upsample");
+    ggml_set_output(x);
+    ggml_cgraph* graph =
+        ggml_new_graph_custom(gctx, 512, false);
+    ggml_build_forward_expand(graph, x);
+
+    const float* source = input_data.data();
+    const size_t source_bytes =
+        input_data.size() * sizeof(float);
+    std::vector<float> output =
+        execute_vocoder_stage_graph(
+            gctx,
+            graph,
+            input,
+            source,
+            source_bytes,
+            &input_data,
+            x,
+            backend,
+            ("upsample_" + std::to_string(stage)).c_str(),
+            log_completion);
+    ggml_free(gctx);
+    mem_release_to_os();
+    return output;
+}
+
+std::vector<float> VocoderModel::run_post_stage(
+    std::vector<float>& input_data,
+    int n_frames,
+    ggml_backend_t backend
+) {
+    const int n_ups =
+        static_cast<int>(config_.upsample_rates.size());
+    const int channels =
+        config_.upsample_initial_channel >> n_ups;
+    if (weights_.conv_post_w == nullptr ||
+        n_frames <= 0 || channels <= 0 ||
+        input_data.size() !=
+            static_cast<size_t>(n_frames) * channels) {
+        return {};
+    }
+
+    ggml_context* gctx = new_vocoder_stage_context();
+    if (gctx == nullptr) {
+        return {};
+    }
+    quant_conv1d_ops_.clear();
+    quant_conv1d_ops_.reserve(1);
+    quant_conv_transpose_ops_.clear();
+
+    ggml_tensor* input = ggml_new_tensor_3d(
+        gctx, GGML_TYPE_F32, n_frames, channels, 1);
+    ggml_tensor* x =
+        ggml_leaky_relu(gctx, input, 0.01f, true);
+    x = conv1d_vocoder(
+        gctx,
+        weights_.conv_post_w,
+        weights_.conv_post_b,
+        x,
+        7,
+        1,
+        3,
+        1,
+        config_.optional_biases,
+        quant_conv1d_ops_,
+        "conv_post");
+    x = ggml_tanh_inplace(gctx, x);
+    ggml_set_name(x, "vocoder_staged_audio");
+    ggml_set_output(x);
+    ggml_cgraph* graph =
+        ggml_new_graph_custom(gctx, 128, false);
+    ggml_build_forward_expand(graph, x);
+
+    const float* source = input_data.data();
+    const size_t source_bytes =
+        input_data.size() * sizeof(float);
+    std::vector<float> output =
+        execute_vocoder_stage_graph(
+            gctx,
+            graph,
+            input,
+            source,
+            source_bytes,
+            &input_data,
+            x,
+            backend,
+            "post",
+            true);
+    ggml_free(gctx);
+    mem_release_to_os();
+    return output;
+}
+
+bool VocoderModel::vocode_staged(
+    const std::string& model_path,
+    const std::vector<float>& mel,
+    int n_mels,
+    int n_frames,
+    ggml_backend_t backend,
+    AudioCallback callback
+) {
+    if (model_path.empty() || !backend || !callback ||
+        n_mels != config_.num_mels ||
+        n_frames <= 0 ||
+        mel.size() !=
+            static_cast<size_t>(n_mels) * n_frames) {
+        return false;
+    }
+    const std::string root =
+        config_.tensor_prefix.empty()
+            ? std::string()
+            : config_.tensor_prefix + ".";
+
+    std::unique_ptr<ModelLoader> loader =
+        std::make_unique<ModelLoader>();
+    if (!loader->load_selected(
+            model_path, {root + "conv_pre."}) ||
+        !load_pre_stage(*loader)) {
+        return false;
+    }
+    std::vector<float> current =
+        run_pre_stage(mel, n_mels, n_frames, backend);
+    loader.reset();
+    mem_release_to_os();
+    runtime_trace_heap("v2 staged pre released");
+    if (current.empty()) {
+        return false;
+    }
+
+    int current_frames = n_frames;
+    const int n_ups =
+        static_cast<int>(config_.upsample_rates.size());
+    const int n_res =
+        static_cast<int>(config_.resblock_kernel_sizes.size());
+    for (int stage = 0; stage < n_ups; ++stage) {
+        std::vector<std::string> prefixes = {
+            root + "ups." + std::to_string(stage) + ".",
+        };
+        for (int branch = 0; branch < n_res; ++branch) {
+            prefixes.push_back(
+                root + "resblocks." +
+                std::to_string(stage * n_res + branch) + ".");
+        }
+        loader = std::make_unique<ModelLoader>();
+        if (!loader->load_selected(model_path, prefixes) ||
+            !load_upsample_stage(*loader, stage)) {
+            return false;
+        }
+        std::vector<float> next =
+            run_upsample_stage(
+                current, current_frames, stage, backend);
+        loader.reset();
+        mem_release_to_os();
+        runtime_trace_heap(
+            ("v2 staged upsample " +
+             std::to_string(stage) +
+             " released").c_str());
+        if (next.empty()) {
+            return false;
+        }
+        current = std::move(next);
+        current_frames *= config_.upsample_rates[stage];
+    }
+
+    loader = std::make_unique<ModelLoader>();
+    if (!loader->load_selected(
+            model_path, {root + "conv_post."}) ||
+        !load_post_stage(*loader)) {
+        return false;
+    }
+    std::vector<float> audio =
+        run_post_stage(current, current_frames, backend);
+    loader.reset();
+    mem_release_to_os();
+    runtime_trace_heap("v2 staged post released");
+    if (audio.empty()) {
+        return false;
+    }
+    callback(audio.data(), audio.size());
+    return true;
+}
+#endif
+
 // ═════════════════════════════════════════════════════════════════════════
 // Full vocoding
 // ═════════════════════════════════════════════════════════════════════════
@@ -1132,7 +3091,11 @@ std::vector<float> VocoderModel::vocode(
             n_frames, n_mels, n_frames * total_upsample());
 
     // Create graph context
+#if defined(INFLECT_LOW_MEMORY)
+    size_t gctx_size = 480 * 1024;
+#else
     size_t gctx_size = 1024 * 1024;
+#endif
     struct ggml_init_params gparams = {
         .mem_size   = gctx_size,
         .mem_buffer = nullptr,
@@ -1281,19 +3244,21 @@ void VocoderModel::vocode_streaming(
     ggml_backend_t backend,
     AudioCallback callback
 ) {
-    constexpr int kLowMemoryMaxChunkFrames = 96;
-    constexpr int kV1LowMemoryMinChunkFrames = 24;
-    constexpr int kV2LowMemoryMinChunkFrames = 1;
     const bool legacy_v1_chunking =
         config_.activation == "snake" &&
         config_.tensor_prefix == "generator";
 
 #if defined(INFLECT_LOW_MEMORY)
+    constexpr int kLowMemoryMaxChunkFrames = 96;
+    constexpr int kV1LowMemoryMinChunkFrames = 24;
+    constexpr int kV2LowMemoryMinChunkFrames = 1;
+    constexpr int low_memory_max_chunk_frames =
+        kLowMemoryMaxChunkFrames;
     if (chunk_frames <= 0) {
-        chunk_frames = kLowMemoryMaxChunkFrames;
+        chunk_frames = low_memory_max_chunk_frames;
     }
-    if (chunk_frames > kLowMemoryMaxChunkFrames) {
-        chunk_frames = kLowMemoryMaxChunkFrames;
+    if (chunk_frames > low_memory_max_chunk_frames) {
+        chunk_frames = low_memory_max_chunk_frames;
     }
     if (legacy_v1_chunking && n_frames > kLowMemoryMaxChunkFrames) {
         chunk_frames = kLowMemoryMaxChunkFrames;
@@ -1305,8 +3270,34 @@ void VocoderModel::vocode_streaming(
             chunk_frames = minimum;
         }
     }
-    fprintf(stderr, "[VocoderModel] low-memory chunk policy frames=%d chunk_frames=%d\n",
-            n_frames, chunk_frames);
+    fprintf(stderr,
+            "[VocoderModel] low-memory chunk policy frames=%d "
+            "chunk_frames=%d max_chunk_frames=%d\n",
+            n_frames, chunk_frames, low_memory_max_chunk_frames);
+#endif
+
+#if defined(INFLECT_LOW_MEMORY)
+    if (!legacy_v1_chunking &&
+        chunk_frames > 0 &&
+        chunk_frames < n_frames &&
+        n_frames <= kLowMemoryMaxChunkFrames) {
+        fprintf(
+            stderr,
+            "[VocoderModel] trying full short utterance "
+            "frames=%d\n",
+            n_frames);
+        auto audio = vocode(
+            mel, n_mels, n_frames, backend);
+        if (!audio.empty()) {
+            callback(audio.data(), audio.size());
+            return;
+        }
+        fprintf(
+            stderr,
+            "[VocoderModel] full short utterance did not fit; "
+            "using chunk_frames=%d\n",
+            chunk_frames);
+    }
 #endif
 
     if (chunk_frames <= 0 || chunk_frames >= n_frames) {
@@ -1420,8 +3411,13 @@ void VocoderModel::vocode_streaming(
     std::vector<float> audio_chunk;
 
     int chunk_index = 0;
+#if defined(INFLECT_LOW_MEMORY)
+    int core_start = 0;
+    while (core_start < n_frames) {
+#else
     for (int core_start = 0; core_start < n_frames;
          core_start += chunk_frames) {
+#endif
         const uint32_t chunk_start_ms = now_ms();
         const int core_end = std::min(core_start + chunk_frames, n_frames);
         const int input_start =
@@ -1443,6 +3439,24 @@ void VocoderModel::vocode_streaming(
 
         audio_chunk = vocode(
             mel_chunk, n_mels, input_frames, backend);
+#if defined(INFLECT_LOW_MEMORY)
+        if (audio_chunk.empty()) {
+            if (chunk_frames <= 1) {
+                std::fprintf(
+                    stderr,
+                    "[VocoderModel] V2 decoder allocation failed at "
+                    "minimum chunk size\n");
+                return;
+            }
+            chunk_frames = std::max(1, chunk_frames / 2);
+            std::fprintf(
+                stderr,
+                "[VocoderModel] retrying V2 decoder core=%d "
+                "chunk_frames=%d\n",
+                core_start, chunk_frames);
+            continue;
+        }
+#endif
         const size_t keep_start =
             static_cast<size_t>(core_start - input_start) * upsample;
         const size_t keep_count =
@@ -1457,6 +3471,9 @@ void VocoderModel::vocode_streaming(
                 chunk_index,
                 (unsigned)(now_ms() - chunk_start_ms));
         chunk_index++;
+#if defined(INFLECT_LOW_MEMORY)
+        core_start = core_end;
+#endif
     }
 }
 

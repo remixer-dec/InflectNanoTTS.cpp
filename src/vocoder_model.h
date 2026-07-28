@@ -2,9 +2,10 @@
 
 #include "model_config.h"
 #include "model_loader.h"
-#include <ggml.h>
-#include <ggml-backend.h>
+#include "../ggml/include/ggml.h"
+#include "../ggml/include/ggml-backend.h"
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace inflect {
@@ -68,6 +69,17 @@ public:
         AudioCallback callback
     );
 
+#if defined(INFLECT_LOW_MEMORY)
+    bool vocode_staged(
+        const std::string& model_path,
+        const std::vector<float>& mel,
+        int n_mels,
+        int n_frames,
+        ggml_backend_t backend,
+        AudioCallback callback
+    );
+#endif
+
     int total_upsample() const;
     const VocoderConfig& config() const { return config_; }
 
@@ -106,6 +118,37 @@ private:
         ggml_context* gctx,
         ggml_tensor* mel
     );
+
+#if defined(INFLECT_LOW_MEMORY)
+    bool load_pre_stage(ModelLoader& loader);
+    bool load_upsample_stage(ModelLoader& loader, int stage);
+    bool load_post_stage(ModelLoader& loader);
+
+    std::vector<float> run_pre_stage(
+        const std::vector<float>& mel,
+        int n_mels,
+        int n_frames,
+        ggml_backend_t backend
+    );
+    std::vector<float> run_upsample_stage(
+        std::vector<float>& input,
+        int input_frames,
+        int stage,
+        ggml_backend_t backend
+    );
+    std::vector<float> run_upsample_stage_once(
+        std::vector<float>& input,
+        int input_frames,
+        int stage,
+        ggml_backend_t backend,
+        bool log_completion
+    );
+    std::vector<float> run_post_stage(
+        std::vector<float>& input,
+        int n_frames,
+        ggml_backend_t backend
+    );
+#endif
 };
 
 } // namespace inflect

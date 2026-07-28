@@ -1,9 +1,9 @@
 #pragma once
 
-#include <ggml.h>
-#include <ggml-backend.h>
-#include <ggml-alloc.h>
-#include <gguf.h>
+#include "../ggml/include/ggml.h"
+#include "../ggml/include/ggml-backend.h"
+#include "../ggml/include/ggml-alloc.h"
+#include "../ggml/include/gguf.h"
 #include <string>
 #include <vector>
 

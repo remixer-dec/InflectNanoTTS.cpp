@@ -81,4 +81,27 @@ if(BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     add_test(NAME v2-frontend COMMAND test-v2-frontend)
+
+    add_executable(test-vocoder-quant-math
+        tests/test_vocoder_quant_math.cpp
+    )
+    target_include_directories(test-vocoder-quant-math PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(
+        NAME vocoder-quant-math
+        COMMAND test-vocoder-quant-math
+    )
+
+    add_executable(test-vocoder-rounding-exhaustive
+        tests/test_vocoder_rounding_exhaustive.cpp
+    )
+    target_include_directories(
+        test-vocoder-rounding-exhaustive PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(
+        NAME vocoder-rounding-exhaustive
+        COMMAND test-vocoder-rounding-exhaustive
+    )
 endif()

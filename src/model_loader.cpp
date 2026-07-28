@@ -1,7 +1,7 @@
 #include "model_loader.h"
 #include "inflect-nano.h"
 #include "memory_trace.h"
-#include <ggml-cpu.h>
+#include "../ggml/include/ggml-cpu.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>

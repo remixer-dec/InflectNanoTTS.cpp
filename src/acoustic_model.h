@@ -2,8 +2,8 @@
 
 #include "model_config.h"
 #include "model_loader.h"
-#include <ggml.h>
-#include <ggml-backend.h>
+#include "../ggml/include/ggml.h"
+#include "../ggml/include/ggml-backend.h"
 #include <vector>
 #include <memory>
 

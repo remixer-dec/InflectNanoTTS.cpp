@@ -1,16 +1,18 @@
 #pragma once
 
-#include <ggml.h>
-#include <ggml-backend.h>
-#include <ggml-alloc.h>
 #include "model_config.h"
 #include "v2_frontend.h"
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+struct ggml_backend_buffer_type;
+
 namespace inflect {
+
+using BackendBufferType = ::ggml_backend_buffer_type*;
 
 enum class ScratchMemoryKind {
     Default,
@@ -18,22 +20,107 @@ enum class ScratchMemoryKind {
     InternalPreferred,
 };
 
+#if defined(INFLECT_LOW_MEMORY)
+using QuantizeF32ToQ8Blocks32Fn = void (*)(
+    const float* source,
+    int8_t* destination,
+    float* cached_scales,
+    size_t blocks,
+    bool skip_zero_blocks,
+    uint64_t* max_cycles,
+    uint64_t* scale_cycles,
+    uint64_t* convert_cycles);
+#endif
+
 struct RuntimeConfig {
-    ggml_backend_buffer_type_t (*weight_buffer_type)() = nullptr;
+    BackendBufferType (*weight_buffer_type)() = nullptr;
     uint32_t (*now_ms)() = nullptr;
+    uint32_t (*now_cycles)() = nullptr;
     void* (*scratch_alloc)(size_t bytes, ScratchMemoryKind kind) = nullptr;
     void (*scratch_free)(void* ptr) = nullptr;
     void (*trace_heap)(const char* label) = nullptr;
+#if defined(INFLECT_LOW_MEMORY)
+    void (*cooperate)() = nullptr;
+    void (*dot_s8_blocks_32)(
+        const int8_t* weights,
+        const int8_t* inputs,
+        int32_t* sums,
+        size_t blocks,
+        size_t rows) = nullptr;
+    void (*dot_s8_scaled_blocks_32)(
+        const int8_t* weights,
+        const float* weight_scales,
+        const int8_t* inputs,
+        const float* input_scales,
+        float* results,
+        size_t blocks,
+        size_t rows,
+        uint64_t* dot_cycles,
+        uint64_t* scale_cycles) = nullptr;
+    void (*unpack_q4_0_blocks_32)(
+        const uint8_t* packed_blocks,
+        size_t packed_block_bytes,
+        int8_t* values,
+        uint16_t* scale_bits,
+        size_t blocks) = nullptr;
+    QuantizeF32ToQ8Blocks32Fn
+        quantize_f32_to_q8_blocks_32 = nullptr;
+    void (*store_zero_s8_blocks_32)(
+        int8_t* destination,
+        size_t blocks) = nullptr;
+    int packed_quant_time_tile = 8;
+#endif
     const char* backend_label = nullptr;
 };
 
 void configure_runtime(const RuntimeConfig& config);
 const RuntimeConfig& runtime_config();
-ggml_backend_buffer_type_t runtime_weight_buffer_type();
+BackendBufferType runtime_weight_buffer_type();
 uint32_t runtime_now_ms();
+uint32_t runtime_now_cycles();
 void* runtime_alloc_scratch(size_t bytes, ScratchMemoryKind kind);
 void runtime_free_scratch(void* ptr);
 void runtime_trace_heap(const char* label);
+#if defined(INFLECT_LOW_MEMORY)
+void runtime_cooperate();
+void runtime_dot_s8_blocks_32(
+    const int8_t* weights,
+    const int8_t* inputs,
+    int32_t* sums,
+    size_t blocks,
+    size_t rows);
+void runtime_dot_s8_scaled_blocks_32(
+    const int8_t* weights,
+    const float* weight_scales,
+    const int8_t* inputs,
+    const float* input_scales,
+    float* results,
+    size_t blocks,
+    size_t rows,
+    uint64_t* dot_cycles,
+    uint64_t* scale_cycles);
+bool runtime_has_s8_dot_blocks_32();
+bool runtime_has_s8_scaled_dot_blocks_32();
+void runtime_unpack_q4_0_blocks_32(
+    const uint8_t* packed_blocks,
+    size_t packed_block_bytes,
+    int8_t* values,
+    uint16_t* scale_bits,
+    size_t blocks);
+void runtime_quantize_f32_to_q8_blocks_32(
+    const float* source,
+    int8_t* destination,
+    float* cached_scales,
+    size_t blocks,
+    bool skip_zero_blocks,
+    uint64_t* max_cycles,
+    uint64_t* scale_cycles,
+    uint64_t* convert_cycles);
+void runtime_store_zero_s8_blocks_32(
+    int8_t* destination,
+    size_t blocks);
+int runtime_packed_quant_time_tile();
+#endif
 const char* runtime_backend_label();
 
 // ─────────────────────────────────────────────────────────────────────────

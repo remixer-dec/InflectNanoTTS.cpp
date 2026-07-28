@@ -3,7 +3,7 @@
 #include "utils.h"
 #include "v2_symbols.h"
 
-#include <ggml-cpu.h>
+#include "../ggml/include/ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
@@ -526,6 +526,11 @@ bool V2Model::load_decoder(ModelLoader& loader) {
         !validate_tensor("dec.conv_post.weight")) {
         return false;
     }
+#if defined(INFLECT_LOW_MEMORY)
+    if (!prepare_staged_decoder()) {
+        return false;
+    }
+#else
     VocoderConfig config;
     config.sample_rate = sample_rate_;
     config.num_mels = latent_channels_;
@@ -534,8 +539,28 @@ bool V2Model::load_decoder(ModelLoader& loader) {
     config.tensor_prefix = "dec";
     config.optional_biases = true;
     decoder_ = std::make_unique<VocoderModel>(config);
+#endif
     return decoder_->load(loader);
 }
+
+#if defined(INFLECT_LOW_MEMORY)
+bool V2Model::prepare_staged_decoder() {
+    if (sample_rate_ <= 0 || latent_channels_ <= 0 ||
+        upsample_initial_channels_ <= 0) {
+        return false;
+    }
+    VocoderConfig config;
+    config.sample_rate = sample_rate_;
+    config.num_mels = latent_channels_;
+    config.upsample_initial_channel =
+        upsample_initial_channels_;
+    config.activation = "leaky_relu";
+    config.tensor_prefix = "dec";
+    config.optional_biases = true;
+    decoder_ = std::make_unique<VocoderModel>(config);
+    return true;
+}
+#endif
 
 bool V2Model::load(ModelLoader& loader) {
     if (!load_duration(loader)) return false;
@@ -818,5 +843,29 @@ void V2Model::decode_streaming(
         latent, latent_channels_, frames, chunk_frames,
         backend, std::move(callback));
 }
+
+#if defined(INFLECT_LOW_MEMORY)
+bool V2Model::decode_staged(
+    const std::string& model_path,
+    const std::vector<float>& latent,
+    int frames,
+    ggml_backend_t backend,
+    AudioCallback callback
+) {
+    if (!decoder_ || frames <= 0 ||
+        latent.size() !=
+            static_cast<size_t>(frames) *
+                latent_channels_) {
+        return false;
+    }
+    return decoder_->vocode_staged(
+        model_path,
+        latent,
+        latent_channels_,
+        frames,
+        backend,
+        std::move(callback));
+}
+#endif
 
 } // namespace inflect

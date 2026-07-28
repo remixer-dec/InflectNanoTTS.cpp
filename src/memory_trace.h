@@ -2,8 +2,8 @@
 
 #include "inflect-nano.h"
 
-#include <ggml.h>
-#include <ggml-alloc.h>
+#include "../ggml/include/ggml.h"
+#include "../ggml/include/ggml-alloc.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

@@ -6,14 +6,16 @@
 #include "v2_frontend.h"
 #include "v2_model.h"
 #include "v2_symbols.h"
+#include "vocoder_quant_math.h"
 #include "model_loader.h"
 #include "memory_trace.h"
 #include "utils.h"
-#include <ggml-cpu.h>
+#include "../ggml/include/ggml-cpu.h"
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -43,6 +45,13 @@ static uint32_t default_now_ms() {
         clock::now().time_since_epoch()).count();
 }
 
+static uint32_t default_now_cycles() {
+    using clock = std::chrono::steady_clock;
+    return static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock::now().time_since_epoch()).count());
+}
+
 void configure_runtime(const RuntimeConfig& config) {
     g_runtime_config = config;
 }
@@ -63,6 +72,12 @@ ggml_backend_buffer_type_t runtime_weight_buffer_type() {
 
 uint32_t runtime_now_ms() {
     return g_runtime_config.now_ms ? g_runtime_config.now_ms() : default_now_ms();
+}
+
+uint32_t runtime_now_cycles() {
+    return g_runtime_config.now_cycles
+               ? g_runtime_config.now_cycles()
+               : default_now_cycles();
 }
 
 void* runtime_alloc_scratch(size_t bytes, ScratchMemoryKind kind) {
@@ -89,6 +104,247 @@ void runtime_trace_heap(const char* label) {
         g_runtime_config.trace_heap(label);
     }
 }
+
+#if defined(INFLECT_LOW_MEMORY)
+void runtime_cooperate() {
+    if (g_runtime_config.cooperate) {
+        g_runtime_config.cooperate();
+    }
+}
+
+void runtime_dot_s8_blocks_32(
+    const int8_t* weights,
+    const int8_t* inputs,
+    int32_t* sums,
+    size_t blocks,
+    size_t rows
+) {
+    if (g_runtime_config.dot_s8_blocks_32) {
+        g_runtime_config.dot_s8_blocks_32(
+            weights, inputs, sums, blocks, rows);
+        return;
+    }
+    for (size_t row = 0; row < rows; ++row) {
+        for (size_t block = 0; block < blocks; ++block) {
+            int32_t sum = 0;
+            const int8_t* weight =
+                weights + block * 32;
+            const int8_t* input =
+                inputs + (row * blocks + block) * 32;
+            for (size_t i = 0; i < 32; ++i) {
+                sum += static_cast<int32_t>(weight[i]) *
+                       static_cast<int32_t>(input[i]);
+            }
+            sums[row * blocks + block] = sum;
+        }
+    }
+}
+
+void runtime_dot_s8_scaled_blocks_32(
+    const int8_t* weights,
+    const float* weight_scales,
+    const int8_t* inputs,
+    const float* input_scales,
+    float* results,
+    size_t blocks,
+    size_t rows,
+    uint64_t* dot_cycles,
+    uint64_t* scale_cycles
+) {
+    if (g_runtime_config.dot_s8_scaled_blocks_32) {
+        g_runtime_config.dot_s8_scaled_blocks_32(
+            weights,
+            weight_scales,
+            inputs,
+            input_scales,
+            results,
+            blocks,
+            rows,
+            dot_cycles,
+            scale_cycles);
+        return;
+    }
+    uint64_t measured_dot_cycles = 0;
+    uint64_t measured_scale_cycles = 0;
+    const bool profile =
+        dot_cycles != nullptr || scale_cycles != nullptr;
+    for (size_t row = 0; row < rows; ++row) {
+        float result = 0.0f;
+        for (size_t block = 0; block < blocks; ++block) {
+            const uint32_t dot_started =
+                profile ? runtime_now_cycles() : 0;
+            int32_t sum = 0;
+            const int8_t* weight =
+                weights + block * 32;
+            const int8_t* input =
+                inputs + (row * blocks + block) * 32;
+            for (size_t i = 0; i < 32; ++i) {
+                sum += static_cast<int32_t>(weight[i]) *
+                       static_cast<int32_t>(input[i]);
+            }
+            const uint32_t dot_finished =
+                profile ? runtime_now_cycles() : 0;
+            result += static_cast<float>(sum) *
+                      weight_scales[block] *
+                      input_scales[row * blocks + block];
+            if (profile) {
+                const uint32_t scale_finished =
+                    runtime_now_cycles();
+                measured_dot_cycles +=
+                    static_cast<uint32_t>(
+                        dot_finished - dot_started);
+                measured_scale_cycles +=
+                    static_cast<uint32_t>(
+                        scale_finished - dot_finished);
+            }
+        }
+        results[row] = result;
+    }
+    if (dot_cycles) {
+        *dot_cycles += measured_dot_cycles;
+    }
+    if (scale_cycles) {
+        *scale_cycles += measured_scale_cycles;
+    }
+}
+
+bool runtime_has_s8_dot_blocks_32() {
+    return g_runtime_config.dot_s8_blocks_32 != nullptr;
+}
+
+bool runtime_has_s8_scaled_dot_blocks_32() {
+    return g_runtime_config.dot_s8_scaled_blocks_32 != nullptr;
+}
+
+void runtime_unpack_q4_0_blocks_32(
+    const uint8_t* packed_blocks,
+    size_t packed_block_bytes,
+    int8_t* values,
+    uint16_t* scale_bits,
+    size_t blocks
+) {
+    if (g_runtime_config.unpack_q4_0_blocks_32) {
+        g_runtime_config.unpack_q4_0_blocks_32(
+            packed_blocks,
+            packed_block_bytes,
+            values,
+            scale_bits,
+            blocks);
+        return;
+    }
+    for (size_t block = 0; block < blocks; ++block) {
+        const uint8_t* source =
+            packed_blocks + block * packed_block_bytes;
+        std::memcpy(
+            scale_bits + block, source, sizeof(uint16_t));
+        source += sizeof(uint16_t);
+        int8_t* destination = values + block * 32;
+        for (size_t index = 0; index < 16; ++index) {
+            destination[index] =
+                static_cast<int8_t>(
+                    (source[index] & 0x0fU) - 8);
+            destination[index + 16] =
+                static_cast<int8_t>(
+                    (source[index] >> 4) - 8);
+        }
+    }
+}
+
+void runtime_quantize_f32_to_q8_blocks_32(
+    const float* source,
+    int8_t* destination,
+    float* cached_scales,
+    size_t blocks,
+    bool skip_zero_blocks,
+    uint64_t* max_cycles,
+    uint64_t* scale_cycles,
+    uint64_t* convert_cycles
+) {
+    if (g_runtime_config.quantize_f32_to_q8_blocks_32) {
+        g_runtime_config.quantize_f32_to_q8_blocks_32(
+            source,
+            destination,
+            cached_scales,
+            blocks,
+            skip_zero_blocks,
+            max_cycles,
+            scale_cycles,
+            convert_cycles);
+        return;
+    }
+    for (size_t block = 0; block < blocks; ++block) {
+#if INFLECT_PROFILE_VOCODER_OPS
+        const uint32_t max_started = runtime_now_cycles();
+#endif
+        const float maximum =
+            vocoder_quant::absolute_max_32(source);
+#if INFLECT_PROFILE_VOCODER_OPS
+        const uint32_t max_finished = runtime_now_cycles();
+#endif
+        const float scale = maximum / 127.0f;
+        const float inverse =
+            scale != 0.0f ? 1.0f / scale : 0.0f;
+        cached_scales[block] =
+            vocoder_quant::cache_scale_fp16(scale);
+#if INFLECT_PROFILE_VOCODER_OPS
+        const uint32_t scale_finished = runtime_now_cycles();
+#endif
+        if (skip_zero_blocks && maximum == 0.0f) {
+            std::memset(destination, 0, 32);
+        } else {
+            for (int index = 0; index < 32; ++index) {
+                destination[index] = static_cast<int8_t>(
+                    vocoder_quant::
+                        round_half_away_from_zero_bits_bounded(
+                            source[index] * inverse));
+            }
+        }
+#if INFLECT_PROFILE_VOCODER_OPS
+        const uint32_t convert_finished = runtime_now_cycles();
+        if (max_cycles != nullptr) {
+            *max_cycles += static_cast<uint32_t>(
+                max_finished - max_started);
+        }
+        if (scale_cycles != nullptr) {
+            *scale_cycles += static_cast<uint32_t>(
+                scale_finished - max_finished);
+        }
+        if (convert_cycles != nullptr) {
+            *convert_cycles += static_cast<uint32_t>(
+                convert_finished - scale_finished);
+        }
+#else
+        (void)max_cycles;
+        (void)scale_cycles;
+        (void)convert_cycles;
+#endif
+        source += 32;
+        destination += 32;
+    }
+}
+
+void runtime_store_zero_s8_blocks_32(
+    int8_t* destination,
+    size_t blocks
+) {
+    if (g_runtime_config.store_zero_s8_blocks_32) {
+        g_runtime_config.store_zero_s8_blocks_32(
+            destination, blocks);
+        return;
+    }
+    std::memset(destination, 0, blocks * 32);
+}
+
+int runtime_packed_quant_time_tile() {
+    constexpr int kDefaultTimeTile = 8;
+    constexpr int kMaxTimeTile = 64;
+    const int configured = g_runtime_config.packed_quant_time_tile;
+    if (configured <= 0) {
+        return kDefaultTimeTile;
+    }
+    return std::min(configured, kMaxTimeTile);
+}
+#endif
 
 const char* runtime_backend_label() {
     return (g_runtime_config.backend_label && g_runtime_config.backend_label[0])
@@ -526,6 +782,8 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
         return;
     }
 #if defined(INFLECT_LOW_MEMORY)
+    const bool use_staged_decoder =
+        latent.channels >= 192;
     v2_loader_.reset();
     mem_release_to_os();
     runtime_trace_heap("v2 duration released");
@@ -545,19 +803,58 @@ void Synthesizer::synthesize_v2_blanked_tokens_streaming(
         mem_release_to_os();
         runtime_trace_heap(("v2 flow " + std::to_string(flow) + " released").c_str());
     }
-    v2_loader_ = std::make_unique<ModelLoader>();
-    if (!v2_loader_->load_selected(v2_model_path_, {"dec."}) ||
-        !v2_model_->load_decoder(*v2_loader_)) {
-        fprintf(stderr, "[Synthesizer] Failed to load V2 decoder stage\n");
-        v2_model_.reset();
-        v2_loader_.reset();
-        return;
+    if (use_staged_decoder) {
+        if (!v2_model_->prepare_staged_decoder()) {
+            fprintf(
+                stderr,
+                "[Synthesizer] Failed to prepare staged V2 decoder\n");
+            v2_model_.reset();
+            return;
+        }
+    } else {
+        v2_loader_ = std::make_unique<ModelLoader>();
+        if (!v2_loader_->load_selected(
+                v2_model_path_, {"dec."}) ||
+            !v2_model_->load_decoder(*v2_loader_)) {
+            fprintf(
+                stderr,
+                "[Synthesizer] Failed to load V2 decoder stage\n");
+            v2_model_.reset();
+            v2_loader_.reset();
+            return;
+        }
     }
 #endif
     V2FadeSink sink{std::move(callback)};
+#if defined(INFLECT_LOW_MEMORY)
+    if (use_staged_decoder) {
+        if (!v2_model_->decode_staged(
+                v2_model_path_,
+                latent.latent,
+                latent.frames,
+                g_backend,
+                [&](const float* samples, size_t count) {
+                    sink.write(samples, count);
+                })) {
+            fprintf(
+                stderr,
+                "[Synthesizer] Staged V2 decoder failed\n");
+        }
+    } else {
+        v2_model_->decode_streaming(
+            latent.latent,
+            latent.frames,
+            params.decoder_chunk_frames,
+            g_backend,
+            [&](const float* samples, size_t count) {
+                sink.write(samples, count);
+            });
+    }
+#else
     v2_model_->decode_streaming(
         latent.latent, latent.frames, params.decoder_chunk_frames, g_backend,
         [&](const float* samples, size_t count) { sink.write(samples, count); });
+#endif
     sink.finish();
 #if defined(INFLECT_LOW_MEMORY)
     v2_model_.reset();
