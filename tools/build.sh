@@ -37,6 +37,7 @@ COMMON_FLAGS=(
   -DGGML_VERSION=\"0.17.0\"
   -DGGML_COMMIT=\"vendored\"
   -I"${ROOT_DIR}"
+  -I"${ROOT_DIR}/src"
   -I"${ROOT_DIR}/ggml/include"
   -I"${ROOT_DIR}/ggml/src"
   -I"${ROOT_DIR}/ggml/src/ggml-cpu"
@@ -47,6 +48,12 @@ if [[ "${INFLECT_LOW_MEMORY:-0}" == "1" ]]; then
 fi
 if [[ "${INFLECT_PROFILE_ACOUSTIC_OPS:-0}" == "1" ]]; then
   COMMON_FLAGS+=(-DINFLECT_PROFILE_ACOUSTIC_OPS=1)
+fi
+if [[ "${INFLECT_PROFILE_VOCODER_OPS:-0}" == "1" ]]; then
+  COMMON_FLAGS+=(-DINFLECT_PROFILE_VOCODER_OPS=1)
+fi
+if [[ "${INFLECT_PROFILE_VOCODER_DETAIL:-0}" == "1" ]]; then
+  COMMON_FLAGS+=(-DINFLECT_PROFILE_VOCODER_DETAIL=1)
 fi
 if [[ "${INFLECT_V2_ESPEAK_FALLBACK:-0}" == "1" ]]; then
   COMMON_FLAGS+=(-DINFLECT_V2_ESPEAK_FALLBACK)
@@ -60,6 +67,13 @@ esac
 C_FLAGS=(-std=c11 "${COMMON_FLAGS[@]}")
 CXX_FLAGS=(-std=c++17 "${COMMON_FLAGS[@]}")
 LD_FLAGS=(-pthread)
+
+if [[ "${INFLECT_SANO_TESTS:-0}" == "1" && "${INFLECT_SANO_SANITIZERS:-0}" == "1" ]]; then
+  SANITIZER_FLAGS=(-g -fno-omit-frame-pointer -fsanitize=address,undefined)
+  C_FLAGS+=("${SANITIZER_FLAGS[@]}")
+  CXX_FLAGS+=("${SANITIZER_FLAGS[@]}")
+  LD_FLAGS+=("${SANITIZER_FLAGS[@]}")
+fi
 
 if [[ "${os_name}" == "Linux" ]]; then
   LD_FLAGS+=(-ldl)
@@ -84,6 +98,9 @@ CXX_SOURCES=(
   src/v2_symbols.cpp
   src/v2_frontend.cpp
   src/v2_model.cpp
+  src/sano_frontend.cpp
+  src/sano_piper_model.cpp
+  src/sano_piper_decoder.cpp
   ggml/src/ggml.cpp
   ggml/src/ggml-backend.cpp
   ggml/src/ggml-backend-meta.cpp
@@ -101,6 +118,11 @@ CXX_SOURCES=(
   ggml/src/ggml-cpu/vec.cpp
   ggml/src/ggml-cpu/ops.cpp
 )
+
+if [[ "${INFLECT_SANO_TESTS:-0}" == "1" ]]; then
+  CXX_SOURCES[0]=tests/test_sano_pipeline.cpp
+  BIN="${BUILD_DIR}/test-sano-pipeline"
+fi
 
 case "${arch_name}" in
   x86_64|amd64)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model_config.h"
+#include "sano_frontend.h"
 #include "v2_frontend.h"
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,7 @@ enum class ScratchMemoryKind {
     Default,
     Psram,
     InternalPreferred,
+    InternalRequired,
 };
 
 #if defined(INFLECT_LOW_MEMORY)
@@ -137,6 +139,13 @@ class VocoderModel;
 class TextFrontend;
 class ModelLoader;
 class V2Model;
+class SanoPiperModel;
+
+struct SanoSynthParams {
+    // Piperlite applies this as a duration multiplier. Values above 1.0
+    // produce slower speech, matching the Sano reference API.
+    float speaking_rate = 1.0f;
+};
 
 class Synthesizer {
 public:
@@ -151,6 +160,7 @@ public:
     bool load_vocoder(const std::string& gguf_path);
     bool load_cmudict(const std::string& bin_path);
     bool load_v2(const std::string& model_gguf, const std::string& lexicon_bin);
+    bool load_sano(const std::string& model_gguf, const std::string& lexicon_bin);
 
     // Full synthesis: text → audio
     std::vector<float> synthesize(
@@ -196,7 +206,13 @@ public:
     );
     int v2_latent_channels() const;
 
-    int sample_rate() const { return 24000; }
+    SanoFrontendResult sano_text_to_tokens(const std::string& text);
+    std::vector<float> synthesize_sano(
+        const std::string& text,
+        const SanoSynthParams& params = {}
+    );
+
+    int sample_rate() const { return sample_rate_; }
 
     // Backend management
     static void init_backend(int n_threads = -1);
@@ -217,6 +233,11 @@ private:
     std::unique_ptr<V2Frontend> v2_frontend_;
     std::unique_ptr<V2Model> v2_model_;
     std::string v2_model_path_;
+    std::unique_ptr<ModelLoader> sano_loader_;
+    std::unique_ptr<SanoFrontend> sano_frontend_;
+    std::unique_ptr<SanoPiperModel> sano_model_;
+    std::string sano_model_path_;
+    int sample_rate_ = 24000;
 };
 
 } // namespace inflect

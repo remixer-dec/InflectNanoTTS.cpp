@@ -71,6 +71,24 @@ inline float cache_scale_fp16(float scale) {
     return fp16_bits_to_fp32(fp32_to_fp16_bits(scale));
 }
 
+inline bool is_normal_fp16_scale(uint32_t bits) {
+    // Positive normal half values, excluding the overflow rounding boundary.
+    return bits >= 0x38800000U && bits < 0x477ff000U;
+}
+
+inline uint32_t round_normal_fp16_scale_bits(uint32_t bits) {
+    // Drop 13 mantissa bits with round-to-nearest, ties-to-even. The result
+    // stays in FP32, so there is no half unpack or exponent rebiasing work.
+    return (bits + 0xfffU + ((bits >> 13) & 1U)) & 0xffffe000U;
+}
+
+inline float cache_positive_scale_fp16(float scale) {
+    const uint32_t bits = float_bits(scale);
+    return is_normal_fp16_scale(bits)
+        ? float_from_bits(round_normal_fp16_scale_bits(bits))
+        : cache_scale_fp16(scale);
+}
+
 inline int round_half_away_from_zero(float value) {
     const int truncated = static_cast<int>(value);
     const float remainder =
@@ -157,6 +175,17 @@ inline float absolute_max_32(const float* values) {
     return std::max(
         std::max(maximum01, maximum23),
         std::max(maximum45, maximum67));
+}
+
+// Positive IEEE-754 magnitudes have the same order as their integer bits.
+// This is also the portable reference for the S3 four-lane integer reduction.
+inline float absolute_max_bits_32(const float* values) {
+    uint32_t maximum = 0;
+    for (int index = 0; index < 32; ++index)
+        maximum = std::max(maximum, float_bits(values[index]) & 0x7fffffffU);
+    // Preserve the float path's treatment of NaNs instead of ordering their
+    // payload bits as numbers. Finite values, infinities and signed zero are exact.
+    return maximum > 0x7f800000U ? absolute_max_32(values) : float_from_bits(maximum);
 }
 
 inline void quantize_s8_32(

@@ -41,18 +41,21 @@ endif()
 
 add_subdirectory(ggml)
 
-add_executable(inflect-nano
-    src/main.cpp
+set(INFLECT_SOURCES
     src/synthesizer.cpp
     src/griffin_lim_vocoder.cpp
     src/model_loader.cpp
     src/acoustic_model.cpp
     src/vocoder_model.cpp
     src/text_frontend.cpp
+    src/sano_frontend.cpp
+    src/sano_piper_model.cpp
+    src/sano_piper_decoder.cpp
     src/v2_symbols.cpp
     src/v2_frontend.cpp
     src/v2_model.cpp
 )
+add_executable(inflect-nano src/main.cpp ${INFLECT_SOURCES})
 
 target_include_directories(inflect-nano PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -80,6 +83,11 @@ if(INFLECT_PROFILE_ACOUSTIC_OPS)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(test-sano-pipeline tests/test_sano_pipeline.cpp ${INFLECT_SOURCES})
+    target_include_directories(test-sano-pipeline PRIVATE src ggml/include)
+    target_compile_definitions(test-sano-pipeline PRIVATE INFLECT_LOW_MEMORY)
+    target_link_libraries(test-sano-pipeline PRIVATE ggml)
+    add_test(NAME sano-pipeline COMMAND test-sano-pipeline)
     add_executable(test-v2-frontend
         tests/test_v2_frontend.cpp
         src/v2_frontend.cpp
@@ -112,4 +120,23 @@ if(BUILD_TESTING)
         NAME vocoder-rounding-exhaustive
         COMMAND test-vocoder-rounding-exhaustive
     )
+
+    add_executable(test-sano-frontend
+        tests/test_sano_frontend.cpp
+        src/sano_frontend.cpp
+        src/v2_frontend.cpp
+        src/v2_symbols.cpp
+    )
+    target_include_directories(test-sano-frontend PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME sano-frontend COMMAND test-sano-frontend)
+
+    add_executable(test-sano-rounding
+        tests/test_sano_rounding.cpp
+    )
+    target_include_directories(test-sano-rounding PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME sano-rounding COMMAND test-sano-rounding)
 endif()

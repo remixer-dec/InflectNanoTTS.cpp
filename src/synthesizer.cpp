@@ -8,6 +8,7 @@
 #include "v2_symbols.h"
 #include "vocoder_quant_math.h"
 #include "model_loader.h"
+#include "sano_piper_model.h"
 #include "memory_trace.h"
 #include "utils.h"
 #include "../ggml/include/ggml-cpu.h"
@@ -37,6 +38,7 @@
 namespace inflect {
 
 static ggml_backend_t g_backend = nullptr;
+static int g_backend_threads = 1;
 static RuntimeConfig g_runtime_config;
 
 static uint32_t default_now_ms() {
@@ -286,20 +288,20 @@ void runtime_quantize_f32_to_q8_blocks_32(
         return;
     }
     for (size_t block = 0; block < blocks; ++block) {
-#if INFLECT_PROFILE_VOCODER_OPS
+#if INFLECT_PROFILE_VOCODER_OPS && INFLECT_PROFILE_VOCODER_DETAIL
         const uint32_t max_started = runtime_now_cycles();
 #endif
         const float maximum =
             vocoder_quant::absolute_max_32(source);
-#if INFLECT_PROFILE_VOCODER_OPS
+#if INFLECT_PROFILE_VOCODER_OPS && INFLECT_PROFILE_VOCODER_DETAIL
         const uint32_t max_finished = runtime_now_cycles();
 #endif
         const float scale = maximum / 127.0f;
         const float inverse =
             scale != 0.0f ? 1.0f / scale : 0.0f;
         cached_scales[block] =
-            vocoder_quant::cache_scale_fp16(scale);
-#if INFLECT_PROFILE_VOCODER_OPS
+            vocoder_quant::cache_positive_scale_fp16(scale);
+#if INFLECT_PROFILE_VOCODER_OPS && INFLECT_PROFILE_VOCODER_DETAIL
         const uint32_t scale_finished = runtime_now_cycles();
 #endif
         if (skip_zero_blocks && maximum == 0.0f) {
@@ -312,7 +314,7 @@ void runtime_quantize_f32_to_q8_blocks_32(
                             source[index] * inverse));
             }
         }
-#if INFLECT_PROFILE_VOCODER_OPS
+#if INFLECT_PROFILE_VOCODER_OPS && INFLECT_PROFILE_VOCODER_DETAIL
         const uint32_t convert_finished = runtime_now_cycles();
         if (max_cycles != nullptr) {
             *max_cycles += static_cast<uint32_t>(
@@ -473,6 +475,7 @@ void Synthesizer::init_backend(int n_threads) {
         }
     }
     if (ggml_backend_is_cpu(g_backend)) {
+        g_backend_threads = threads;
         ggml_backend_cpu_set_n_threads(g_backend, threads);
         ggml_backend_cpu_set_abort_callback(
             g_backend, backend_abort_callback, nullptr);
@@ -488,6 +491,7 @@ void Synthesizer::set_backend_threads(int n_threads) {
         return;
     }
     ggml_backend_cpu_set_n_threads(g_backend, n_threads);
+    g_backend_threads = n_threads;
     fprintf(stderr, "[Synthesizer] Backend threads set=%d\n", n_threads);
 }
 
@@ -537,6 +541,7 @@ bool Synthesizer::load_acoustic(const std::string& path) {
     cfg.max_frames     = acoustic_loader_->get_i32("max_frames", 1400);
     cfg.postnet_scale  = acoustic_loader_->get_f32("postnet_scale", 0.1f);
     acoustic_config_ = cfg;
+    sample_rate_ = cfg.sample_rate;
 
     acoustic_ = std::make_unique<AcousticModel>(cfg);
 #if defined(INFLECT_LOW_MEMORY)
@@ -618,11 +623,44 @@ bool Synthesizer::load_v2(const std::string& model_path,
     v2_frontend_ = std::move(frontend);
     v2_model_ = std::move(model);
     v2_model_path_ = model_path;
+    sample_rate_ = 24000;
     fprintf(stderr,
             "[Synthesizer] Loaded Inflect v2 model=%s lexicon=%s symbols=%s"
             " weight_mode=staged\n",
             model_path.c_str(), lexicon_path.c_str(), v2::kSymbolHashHex);
     mem_trace_rss("after v2 load");
+    return true;
+}
+
+bool Synthesizer::load_sano(const std::string& model_path,
+                            const std::string& lexicon_path) {
+    auto loader = std::make_unique<ModelLoader>();
+    if (!loader->open(model_path)) return false;
+
+    auto model = std::make_unique<SanoPiperModel>();
+    if (!model->configure(*loader)) {
+        fprintf(stderr, "[Synthesizer] Sano model metadata is invalid\n");
+        return false;
+    }
+
+    auto frontend = std::make_unique<SanoFrontend>();
+    if (!frontend->load_lexicon(lexicon_path, model->config())) {
+        fprintf(stderr, "[Synthesizer] Failed to load Sano lexicon\n");
+        return false;
+    }
+
+    sample_rate_ = model->config().sample_rate;
+    sano_model_path_ = model_path;
+    sano_loader_ = std::move(loader);
+    sano_frontend_ = std::move(frontend);
+    sano_model_ = std::move(model);
+    fprintf(stderr,
+            "[Synthesizer] Loaded Sano Piperlite model=%s lexicon=%s "
+            "voice=%s language=%s sample_rate=%d\n",
+            model_path.c_str(), lexicon_path.c_str(),
+            sano_model_->config().voice.c_str(),
+            sano_model_->config().language.c_str(), sample_rate_);
+    mem_trace_rss("after sano load");
     return true;
 }
 
@@ -636,6 +674,55 @@ V2FrontendResult Synthesizer::v2_text_to_tokens(const std::string& text) {
 
 int Synthesizer::v2_latent_channels() const {
     return v2_model_ ? v2_model_->latent_channels() : 0;
+}
+
+SanoFrontendResult Synthesizer::sano_text_to_tokens(const std::string& text) {
+    if (!sano_frontend_ || !sano_model_) {
+        fprintf(stderr, "[Synthesizer] Sano frontend/model not loaded\n");
+        return {};
+    }
+    return sano_frontend_->process(text, sano_model_->config());
+}
+
+std::vector<float> Synthesizer::synthesize_sano(
+    const std::string& text,
+    const SanoSynthParams& params
+) {
+    if (!g_backend || !sano_frontend_ || !sano_model_ || !sano_loader_) {
+        fprintf(stderr, "[Synthesizer] Sano model/backend not loaded\n");
+        return {};
+    }
+    if (params.speaking_rate < 0.5f || params.speaking_rate > 2.0f ||
+        !std::isfinite(params.speaking_rate)) {
+        fprintf(stderr,
+                "[Synthesizer] Sano speaking_rate out of range: %.3f\n",
+                params.speaking_rate);
+        return {};
+    }
+
+    const uint32_t frontend_started = runtime_now_ms();
+    const SanoFrontendResult frontend = sano_text_to_tokens(text);
+    fprintf(stderr, "[SanoStage] frontend tokens=%zu elapsed_ms=%u\n",
+            frontend.tokens.size(),
+            static_cast<unsigned>(runtime_now_ms() - frontend_started));
+    if (!frontend.ok || frontend.tokens.empty()) {
+        fprintf(stderr, "[Synthesizer] Sano frontend produced no tokens\n");
+        return {};
+    }
+    if (!frontend.oov_words.empty()) {
+        fprintf(stderr, "[Synthesizer] Sano frontend skipped %zu OOV word(s)\n",
+                frontend.oov_words.size());
+    }
+
+    const uint32_t started_ms = runtime_now_ms();
+    SanoThreadpoolScope threadpool(g_backend, g_backend_threads);
+    std::vector<float> audio = sano_model_->synthesize(
+        *sano_loader_, frontend.tokens, params.speaking_rate, g_backend);
+    fprintf(stderr,
+            "[SanoStage] tokens=%zu samples=%zu speaking_rate=%.3f elapsed_ms=%u\n",
+            frontend.tokens.size(), audio.size(), params.speaking_rate,
+            static_cast<unsigned>(runtime_now_ms() - started_ms));
+    return audio;
 }
 
 static std::vector<std::string> split_v2_text(const std::string& input,

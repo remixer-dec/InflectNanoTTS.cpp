@@ -37,6 +37,10 @@
 #define INFLECT_PROFILE_VOCODER_OPS 0
 #endif
 
+#ifndef INFLECT_PROFILE_VOCODER_DETAIL
+#define INFLECT_PROFILE_VOCODER_DETAIL 0
+#endif
+
 namespace inflect {
 
 struct VocoderFloatScratch {
@@ -150,13 +154,19 @@ struct VocoderInternalByteScratch {
         runtime_free_scratch(allocation);
     }
 
-    bool try_resize(size_t n) {
+    void clear() {
+        runtime_free_scratch(allocation);
+        allocation = ptr = nullptr;
+        cap = 0;
+    }
+
+    bool try_resize(size_t n, ScratchMemoryKind kind = ScratchMemoryKind::InternalPreferred) {
         if (n <= cap) {
             return true;
         }
         runtime_free_scratch(allocation);
         allocation = runtime_alloc_scratch(
-            n + 15, ScratchMemoryKind::InternalPreferred);
+            n + 15, kind);
         if (allocation == nullptr) {
             ptr = nullptr;
             cap = 0;
@@ -224,6 +234,18 @@ static VocodeOpProfileBucket g_vocode_profile_buckets[] = {
     {"resblock.convs1", {}, {}, {}, {}, {}, {}, {}, {}},
     {"resblock.convs2", {}, {}, {}, {}, {}, {}, {}, {}},
     {"conv_post", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.duration", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.acoustic.token", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.acoustic.frame", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.decoder.pre", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.decoder.upsample", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.res.conv1", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.res.conv2", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.decoder.post", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.post_filter.in", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.post_filter.conv1", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.post_filter.conv2", {}, {}, {}, {}, {}, {}, {}, {}},
+    {"sano.post_filter.out", {}, {}, {}, {}, {}, {}, {}, {}},
 };
 
 static void vocode_profile_reset() {
@@ -395,7 +417,7 @@ static void vocode_profile_log(uint32_t graph_compute_ms) {
             bucket.input_values.load();
         const uint64_t zero_input_values =
             bucket.zero_input_values.load();
-        if (input_blocks > 0) {
+        if (INFLECT_PROFILE_VOCODER_DETAIL && input_blocks > 0) {
             fprintf(
                 stderr,
                 "[VocoderInputSparsity] op=%s "
@@ -420,14 +442,15 @@ static void vocode_profile_log(uint32_t graph_compute_ms) {
     }
 #if defined(INFLECT_LOW_MEMORY)
     fprintf(stderr,
-            "[VocoderPackedProfile] tile=%d input_gather_cycles=%llu "
+            "[VocoderPackedProfile] tile=%d detail=%d input_gather_cycles=%llu "
             "reused_input_blocks=%llu "
             "input_quant_cycles=%llu "
             "input_max_cycles=%llu input_scale_cycles=%llu "
             "input_convert_cycles=%llu "
-            "q4_unpack_cycles=%llu s8_dot_cycles=%llu "
+            "q4_unpack_cycles=%llu dot_reduce_cycles=%llu s8_dot_cycles=%llu "
             "scale_reduce_cycles=%llu output_write_cycles=%llu\n",
             runtime_packed_quant_time_tile(),
+            INFLECT_PROFILE_VOCODER_DETAIL,
             (unsigned long long)
                 g_vocode_packed_profile.input_gather_cycles.load(),
             (unsigned long long)
@@ -442,6 +465,8 @@ static void vocode_profile_log(uint32_t graph_compute_ms) {
                 g_vocode_packed_profile.input_convert_cycles.load(),
             (unsigned long long)
                 g_vocode_packed_profile.q4_unpack_cycles.load(),
+            (unsigned long long)(g_vocode_packed_profile.s8_dot_cycles.load() +
+                g_vocode_packed_profile.scale_reduce_cycles.load()),
             (unsigned long long)
                 g_vocode_packed_profile.s8_dot_cycles.load(),
             (unsigned long long)
@@ -633,6 +658,7 @@ struct Q4Q8TileDot {
 #if INFLECT_PROFILE_VOCODER_OPS
         uint64_t window_zero_values = 0;
         uint64_t window_zero_blocks = 0;
+#if INFLECT_PROFILE_VOCODER_DETAIL
         for (int32_t block = 0; block < block_count; ++block) {
             uint64_t block_zero_values = 0;
             for (int index = 0; index < kQ4BlockElements; ++index) {
@@ -644,6 +670,7 @@ struct Q4Q8TileDot {
             window_zero_blocks += static_cast<uint64_t>(
                 block_zero_values == kQ4BlockElements);
         }
+#endif
         profiled_input_values +=
             static_cast<uint64_t>(
                 block_count * kQ4BlockElements);
@@ -668,9 +695,9 @@ struct Q4Q8TileDot {
         uint64_t max_cycles = 0;
         uint64_t scale_cycles = 0;
         uint64_t convert_cycles = 0;
-        uint64_t* max_cycles_ptr = &max_cycles;
-        uint64_t* scale_cycles_ptr = &scale_cycles;
-        uint64_t* convert_cycles_ptr = &convert_cycles;
+        uint64_t* max_cycles_ptr = INFLECT_PROFILE_VOCODER_DETAIL ? &max_cycles : nullptr;
+        uint64_t* scale_cycles_ptr = INFLECT_PROFILE_VOCODER_DETAIL ? &scale_cycles : nullptr;
+        uint64_t* convert_cycles_ptr = INFLECT_PROFILE_VOCODER_DETAIL ? &convert_cycles : nullptr;
 #else
         uint64_t* max_cycles_ptr = nullptr;
         uint64_t* scale_cycles_ptr = nullptr;
@@ -762,7 +789,9 @@ struct Q4Q8TileDot {
         uint64_t source_zero_blocks,
         uint64_t source_zero_values
 #endif
+        , const Q4Q8TileDot* source_dot = nullptr
     ) {
+        if (source_dot == nullptr) source_dot = this;
         auto* destination_values =
             static_cast<int8_t*>(input_values.data()) +
             static_cast<size_t>(destination_tile) *
@@ -770,9 +799,9 @@ struct Q4Q8TileDot {
             static_cast<size_t>(destination_first_block) *
                 kQ4BlockElements;
         const auto* source_values =
-            static_cast<const int8_t*>(input_values.data()) +
+            static_cast<const int8_t*>(source_dot->input_values.data()) +
             static_cast<size_t>(source_tile) *
-                static_cast<size_t>(elements) +
+                static_cast<size_t>(source_dot->elements) +
             static_cast<size_t>(source_first_block) *
                 kQ4BlockElements;
         auto* destination_scales =
@@ -781,9 +810,9 @@ struct Q4Q8TileDot {
                 static_cast<size_t>(blocks) +
             static_cast<size_t>(destination_first_block);
         const auto* source_scales =
-            static_cast<const Q4Q8Scale*>(input_scales.data()) +
+            static_cast<const Q4Q8Scale*>(source_dot->input_scales.data()) +
             static_cast<size_t>(source_tile) *
-                static_cast<size_t>(blocks) +
+                static_cast<size_t>(source_dot->blocks) +
             static_cast<size_t>(source_first_block);
         std::memcpy(
             destination_values,
@@ -807,27 +836,36 @@ struct Q4Q8TileDot {
 #endif
     }
 
-    void unpack_weight(const void* row) {
+    // A slice retains the original Q4 block boundaries and scales. Upsampling
+    // uses this to pack only blocks belonging to the current stride phase.
+    void unpack_weight(const void* row, const int8_t* cached_values = nullptr,
+                       const float* cached_scales = nullptr, int first_block = 0,
+                       int count = -1, int destination_block = 0) {
+        if (count < 0) count = blocks;
 #if INFLECT_PROFILE_VOCODER_OPS
         const uint32_t started = runtime_now_cycles();
 #endif
         auto* values =
-            static_cast<int8_t*>(weight_values.data());
+            static_cast<int8_t*>(weight_values.data()) + destination_block * 32;
         auto* scales =
             static_cast<Q4Q8Scale*>(
-                weight_scales.data());
+                weight_scales.data()) + destination_block;
         auto* scale_bits =
             static_cast<uint16_t*>(
-                weight_scale_bits.data());
-        runtime_unpack_q4_0_blocks_32(
-            static_cast<const uint8_t*>(row),
-            sizeof(PackedQ4Block),
-            values,
-            scale_bits,
-            static_cast<size_t>(blocks));
-        for (int32_t block = 0; block < blocks; ++block) {
-            scales[block] =
-                cache_weight_scale(scale_bits[block]);
+                weight_scale_bits.data()) + destination_block;
+        if (cached_values && cached_scales) {
+            std::memcpy(values, cached_values + first_block * 32, static_cast<size_t>(count) * 32);
+            std::memcpy(scales, cached_scales + first_block, static_cast<size_t>(count) * sizeof(float));
+        } else {
+            runtime_unpack_q4_0_blocks_32(
+                static_cast<const uint8_t*>(row) + static_cast<size_t>(first_block) * sizeof(PackedQ4Block),
+                sizeof(PackedQ4Block),
+                values,
+                scale_bits,
+                static_cast<size_t>(count));
+            for (int32_t block = 0; block < count; ++block) {
+                scales[block] = cache_weight_scale(scale_bits[block]);
+            }
         }
 #if INFLECT_PROFILE_VOCODER_OPS
         q4_unpack_cycles += static_cast<uint32_t>(
@@ -838,10 +876,11 @@ struct Q4Q8TileDot {
     void calculate(int rows) {
         if (runtime_has_s8_scaled_dot_blocks_32()) {
 #if INFLECT_PROFILE_VOCODER_OPS
+            const uint32_t started = runtime_now_cycles();
             uint64_t dot_cycles = 0;
             uint64_t reduce_cycles = 0;
-            uint64_t* dot_cycles_ptr = &dot_cycles;
-            uint64_t* reduce_cycles_ptr = &reduce_cycles;
+            uint64_t* dot_cycles_ptr = INFLECT_PROFILE_VOCODER_DETAIL ? &dot_cycles : nullptr;
+            uint64_t* reduce_cycles_ptr = INFLECT_PROFILE_VOCODER_DETAIL ? &reduce_cycles : nullptr;
 #else
             uint64_t* dot_cycles_ptr = nullptr;
             uint64_t* reduce_cycles_ptr = nullptr;
@@ -862,7 +901,8 @@ struct Q4Q8TileDot {
                 dot_cycles_ptr,
                 reduce_cycles_ptr);
 #if INFLECT_PROFILE_VOCODER_OPS
-            s8_dot_cycles += dot_cycles;
+            s8_dot_cycles += INFLECT_PROFILE_VOCODER_DETAIL ? dot_cycles :
+                static_cast<uint32_t>(runtime_now_cycles() - started);
             scale_reduce_cycles += reduce_cycles;
 #endif
             return;
@@ -912,9 +952,27 @@ struct Q4Q8TileDot {
 #endif
     }
 
-    float value(int row) const {
-        return static_cast<const float*>(
-            results.data())[row];
+    // Resolve tensor offsets once per tile, not with 64-bit arithmetic for
+    // every sample on the 32-bit MCU. Bias addition retains its original order.
+    void write_results(char* destination, size_t stride, int rows,
+                       const float* bias = nullptr) const {
+        const auto* values = static_cast<const float*>(results.data());
+        if (stride == sizeof(float)) {
+            if (bias == nullptr) {
+                std::memcpy(destination, values, rows * sizeof(float));
+            } else {
+                auto* output = reinterpret_cast<float*>(destination);
+                const float offset = *bias;
+                for (int row = 0; row < rows; ++row) output[row] = values[row] + offset;
+            }
+        } else if (bias == nullptr) {
+            for (int row = 0; row < rows; ++row, destination += stride)
+                *reinterpret_cast<float*>(destination) = values[row];
+        } else {
+            const float offset = *bias;
+            for (int row = 0; row < rows; ++row, destination += stride)
+                *reinterpret_cast<float*>(destination) = values[row] + offset;
+        }
     }
 };
 
@@ -1122,6 +1180,93 @@ struct QuantizedSourceRef {
     uint16_t reserved = 0;
 };
 
+// Stage a bounded channel panel, then quantize whole rows of existing Q8
+// blocks. Thirty-two channels keep every panel boundary block-aligned even
+// for odd kernels; no activation scale or flattening order is changed.
+struct ConvInputPanel {
+    static constexpr int kChannels = 32;
+    // Quantization already consumes one row at a time. Four staging rows keep
+    // channel locality without retaining sixteen float windows per worker.
+    static constexpr int kRows = 4;
+    VocoderInternalByteScratch source;
+    VocoderInternalByteScratch windows;
+    bool enabled = false;
+
+    bool init(int channels, int kernel, int64_t span) {
+        if (channels > 96 || span <= 0 || span > 128 ||
+            (kernel != 3 && kernel != 5 && kernel != 7)) return false;
+        const int panel_channels = std::min(channels, kChannels);
+        const int row_elements = (panel_channels * kernel + 31) / 32 * 32;
+        enabled = source.try_resize(panel_channels * static_cast<size_t>(span) * sizeof(float),
+                                    ScratchMemoryKind::InternalRequired) &&
+            windows.try_resize(kRows * row_elements * sizeof(float),
+                               ScratchMemoryKind::InternalRequired);
+        // An optional speed cache must not spill into PSRAM or retain SRAM
+        // after a partial allocation failure. The original writer still works.
+        if (!enabled) { source.clear(); windows.clear(); }
+        return enabled;
+    }
+
+    template<int Kernel>
+    void pack(Q4Q8TileDot& dot, const ggml_tensor* x,
+              const VocoderQuantConv1dOpData& p, int64_t batch,
+              int64_t tile_start, int tile_count) {
+        const int span = (tile_count - 1) * p.stride + (Kernel - 1) * p.dilation + 1;
+        const int64_t first = tile_start * p.stride - p.padding;
+        const int begin = static_cast<int>(std::clamp<int64_t>(-first, 0, span));
+        const int end = static_cast<int>(std::clamp<int64_t>(x->ne[0] - first, begin, span));
+        auto* staged = static_cast<float*>(source.data());
+        auto* rows = static_cast<float*>(windows.data());
+        for (int channel = 0; channel < x->ne[1]; channel += kChannels) {
+            const int channels = std::min<int64_t>(kChannels, x->ne[1] - channel);
+            const int elements = (channels * Kernel + 31) / 32 * 32;
+            for (int c = 0; c < channels; ++c) {
+                float* target = staged + c * span;
+                std::fill(target, target + begin, 0.0f);
+                std::fill(target + end, target + span, 0.0f);
+                if (end == begin) continue;
+                const char* input = static_cast<const char*>(x->data) +
+                    batch * x->nb[2] + (channel + c) * x->nb[1] + (first + begin) * x->nb[0];
+                if (x->nb[0] == sizeof(float)) {
+                    std::memcpy(target + begin, input, (end - begin) * sizeof(float));
+                } else {
+                    for (int t = begin; t < end; ++t, input += x->nb[0])
+                        target[t] = *reinterpret_cast<const float*>(input);
+                }
+            }
+            for (int start = 0; start < tile_count; start += kRows) {
+                const int count = std::min(kRows, tile_count - start);
+                for (int c = 0; c < channels; ++c) {
+                    const float* input = staged + c * span + start * p.stride;
+                    float* output = rows + c * Kernel;
+                    for (int row = 0; row < count; ++row) {
+                        for (int k = 0; k < Kernel; ++k)
+                            output[k] = input[k * p.dilation];
+                        input += p.stride;
+                        output += elements;
+                    }
+                }
+                for (int row = 0; row < count; ++row) {
+                    float* values = rows + row * elements;
+                    std::fill(values + channels * Kernel, values + elements, 0.0f);
+                    dot.quantize_blocks(start + row, channel * Kernel / 32,
+                                        values, elements / 32, false);
+                }
+            }
+        }
+    }
+
+    void pack(Q4Q8TileDot& dot, const ggml_tensor* x,
+              const VocoderQuantConv1dOpData& p, int64_t batch,
+              int64_t tile_start, int tile_count) {
+        switch (p.kernel_size) {
+            case 3: pack<3>(dot, x, p, batch, tile_start, tile_count); break;
+            case 5: pack<5>(dot, x, p, batch, tile_start, tile_count); break;
+            case 7: pack<7>(dot, x, p, batch, tile_start, tile_count); break;
+        }
+    }
+};
+
 struct PackedQuantDot {
     const ggml_type_traits_cpu* weight_traits = nullptr;
     const ggml_type_traits_cpu* input_traits = nullptr;
@@ -1187,20 +1332,25 @@ static bool quant_conv1d_packed_op(
     VocoderInternalFloatScratch bias_values;
     VocoderInternalByteScratch hot_input_block;
     VocoderInternalByteScratch channel_span_scratch;
+    ConvInputPanel input_panel;
     VocoderInternalByteScratch quantized_windows;
     VocoderInternalByteScratch weight_row;
     std::unique_ptr<Q4Q8TileDot> q4_dot;
     std::unique_ptr<Q8HotBlockWriter[]> tile_writers;
-    const int time_tile = runtime_packed_quant_time_tile();
     const bool use_q4_dot =
         weight->type == GGML_TYPE_Q4_0 &&
         runtime_has_s8_dot_blocks_32();
+    const int64_t time_start = use_q4_dot ? (T * ith) / nth : 0;
+    const int64_t time_end = use_q4_dot ? (T * (ith + 1)) / nth : T;
+    if (time_start == time_end) return true;
+    // A short worker slice never uses the rest of a configured tile. In the
+    // 34-frame pre-convolution this halves the largest internal allocation.
+    const int time_tile = static_cast<int>(std::min<int64_t>(
+        runtime_packed_quant_time_tile(), time_end - time_start));
     const size_t weight_row_bytes =
         ggml_row_size(weight->type, packed.elements);
     if (use_q4_dot) {
         q4_dot.reset(new (std::nothrow) Q4Q8TileDot());
-        tile_writers.reset(
-            new (std::nothrow) Q8HotBlockWriter[time_tile]);
     } else {
         input_window.resize(static_cast<size_t>(packed.elements));
     }
@@ -1211,15 +1361,8 @@ static bool quant_conv1d_packed_op(
         1;
     if (use_q4_dot
             ? (q4_dot == nullptr ||
-               tile_writers == nullptr ||
                !q4_dot->init(
-                   packed.elements, time_tile) ||
-               !hot_input_block.try_resize(
-                   static_cast<size_t>(time_tile) *
-                   kQ4BlockElements * sizeof(float)) ||
-               !channel_span_scratch.try_resize(
-                   static_cast<size_t>(maximum_channel_span) *
-                   sizeof(float)))
+                   packed.elements, time_tile))
             : (!quantized_windows.try_resize(
                    packed.input_bytes *
                        static_cast<size_t>(time_tile)) ||
@@ -1228,14 +1371,24 @@ static bool quant_conv1d_packed_op(
         return false;
     }
 
+    if (use_q4_dot && packed.elements == (flat + 31) / 32 * 32 &&
+        maximum_channel_span < static_cast<int64_t>(time_tile) * p->kernel_size)
+        input_panel.init(static_cast<int>(in_ch), p->kernel_size, maximum_channel_span);
+
+    // Panel and writer packing are mutually exclusive for this operation.
+    // Allocate the fallback only after the optional internal panel failed.
+    if (use_q4_dot && !input_panel.enabled) {
+        tile_writers.reset(new (std::nothrow) Q8HotBlockWriter[time_tile]);
+        if (!tile_writers ||
+            !hot_input_block.try_resize(static_cast<size_t>(time_tile) * 32 * sizeof(float)) ||
+            !channel_span_scratch.try_resize(static_cast<size_t>(maximum_channel_span) * sizeof(float)))
+            return false;
+    }
+
     // The Q4 path spends substantially more time gathering and quantizing
     // input windows than it does in the packed dot product. Split time
     // across workers so each window is quantized once globally. Other
     // quantized formats retain the output-channel split used by ggml.
-    const int64_t time_start =
-        use_q4_dot ? (T * ith) / nth : 0;
-    const int64_t time_end =
-        use_q4_dot ? (T * (ith + 1)) / nth : T;
     const int64_t out_start =
         use_q4_dot ? 0 : (out_ch * ith) / nth;
     const int64_t out_end =
@@ -1288,7 +1441,9 @@ static bool quant_conv1d_packed_op(
                     channel_span_count <
                     static_cast<int64_t>(tile_count) *
                         p->kernel_size;
-                if (stage_channel_span) {
+                if (input_panel.enabled) {
+                    input_panel.pack(*q4_dot, x, *p, b, tile_start, tile_count);
+                } else if (stage_channel_span) {
                     for (int tile = 0;
                          tile < tile_count;
                          ++tile) {
@@ -1537,7 +1692,9 @@ static bool quant_conv1d_packed_op(
                     static_cast<const char*>(weight->data) +
                     o * weight->nb[1];
                 if (use_q4_dot) {
-                    q4_dot->unpack_weight(source_weight);
+                    q4_dot->unpack_weight(source_weight,
+                        p->cached_values ? p->cached_values + o * packed.elements : nullptr,
+                        p->cached_scales ? p->cached_scales + o * (packed.elements / 32) : nullptr);
                     q4_dot->calculate(tile_count);
                 } else {
                     std::memcpy(
@@ -1545,14 +1702,20 @@ static bool quant_conv1d_packed_op(
                         source_weight,
                         weight_row_bytes);
                 }
-                for (int tile = 0;
+#if INFLECT_PROFILE_VOCODER_OPS
+                const uint32_t write_started = use_q4_dot ? runtime_now_cycles() : 0;
+#endif
+                if (use_q4_dot) {
+                    q4_dot->write_results(
+                        dst_data + tile_start * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2],
+                        dst->nb[0], tile_count,
+                        bias != nullptr ? bias_values.data() + o - out_start : nullptr);
+                } else for (int tile = 0;
                      tile < tile_count;
                      ++tile) {
                     const int64_t t = tile_start + tile;
                     float value;
-                    if (use_q4_dot) {
-                        value = q4_dot->value(tile);
-                    } else {
+                    {
                         const void* quantized =
                             static_cast<const char*>(
                                 quantized_windows.data()) +
@@ -1580,22 +1743,12 @@ static bool quant_conv1d_packed_op(
                         t * dst->nb[0] +
                         o * dst->nb[1] +
                         b * dst->nb[2]);
-#if INFLECT_PROFILE_VOCODER_OPS
-                    if (use_q4_dot) {
-                        const uint32_t write_started =
-                            runtime_now_cycles();
-                        *output = value;
-                        output_write_cycles +=
-                            static_cast<uint32_t>(
-                                runtime_now_cycles() -
-                                write_started);
-                    } else {
-                        *output = value;
-                    }
-#else
                     *output = value;
-#endif
                 }
+#if INFLECT_PROFILE_VOCODER_OPS
+                if (use_q4_dot) output_write_cycles +=
+                    static_cast<uint32_t>(runtime_now_cycles() - write_started);
+#endif
             }
             runtime_cooperate();
         }
@@ -2019,6 +2172,141 @@ static ggml_tensor* conv1d_vocoder(
 }
 
 #if defined(INFLECT_LOW_MEMORY)
+// Outputs in one stride phase share the same nonzero weight blocks. Keep
+// those blocks compact instead of allocating a tile of mostly-zero im2col.
+// The channel/stride alignment guarantees distinct original blocks per tap,
+// including the leading/trailing padding of 48-channel Q4 rows.
+static bool quant_conv_transpose_phase_op(
+    ggml_tensor* dst, int ith, int nth, const QuantConvTranspose1dOpData* p,
+    const ggml_tensor* x, const ggml_tensor* weight, int64_t full_elements
+) {
+    const int channels = static_cast<int>(x->ne[1]);
+    const int taps = p->kernel_size / p->stride;
+    const int64_t time_begin = dst->ne[0] * ith / nth;
+    const int64_t time_end = dst->ne[0] * (ith + 1) / nth;
+    if (time_begin == time_end) return true;
+    const int tile_capacity = static_cast<int>(std::min<int64_t>(
+        runtime_packed_quant_time_tile(),
+        (time_end - time_begin + p->stride - 1) / p->stride));
+    auto dot = std::unique_ptr<Q4Q8TileDot>(new (std::nothrow) Q4Q8TileDot());
+    auto sources = std::unique_ptr<Q4Q8TileDot>(new (std::nothrow) Q4Q8TileDot());
+    VocoderInternalByteScratch hot;
+    VocoderInternalByteScratch references;
+    // Only distinct positions within an original 32-value block need their
+    // own quantized source. E.g. 48 channels have two alignments, not four
+    // separate stride phases. Bound the cache to one group of output tiles.
+    int alignment_step = 32;
+    while (channels % alignment_step != 0) alignment_step /= 2;
+    const int alignments = 32 / alignment_step;
+    const int source_capacity = tile_capacity + taps + 1;
+    const int source_blocks = (channels + 63 - alignment_step) / 32;
+    if (!dot || !sources ||
+        !sources->init(source_blocks * 32, source_capacity * alignments, true) ||
+        !references.try_resize(source_capacity * alignments * sizeof(QuantizedSourceRef)) ||
+        !hot.try_resize(static_cast<size_t>(channels + 63) * sizeof(float))) return false;
+    float* values = static_cast<float*>(hot.data());
+    auto* refs = static_cast<QuantizedSourceRef*>(references.data());
+#if INFLECT_PROFILE_VOCODER_OPS
+    uint64_t output_write_cycles = 0;
+#endif
+    for (int64_t batch = 0; batch < dst->ne[2]; ++batch) {
+    for (int64_t group = time_begin; group < time_end;
+         group += static_cast<int64_t>(tile_capacity) * p->stride) {
+        const int64_t group_end = std::min(time_end, group + static_cast<int64_t>(tile_capacity) * p->stride);
+        const int64_t cache_first = (group + p->crop_left) / p->stride - (taps - 1);
+        for (int i = 0; i < source_capacity * alignments; ++i) refs[i].tile = -1;
+    for (int phase = 0; phase < p->stride; ++phase) {
+        const int leading = phase * channels % 32;
+        const int tap_blocks = (leading + channels + 31) / 32;
+        if (!dot->init(taps * tap_blocks * 32, tile_capacity, true)) return false;
+        std::fill(values, values + tap_blocks * 32, 0.0f);
+        const int64_t first = group +
+            (phase - (group + p->crop_left) % p->stride + p->stride) % p->stride;
+        if (first >= group_end) continue;
+        const int64_t phase_rows = (group_end - 1 - first) / p->stride + 1;
+        const int64_t first_source = (first + p->crop_left - phase) / p->stride;
+            for (int64_t start = 0; start < phase_rows; start += tile_capacity) {
+                const int count = static_cast<int>(std::min<int64_t>(tile_capacity, phase_rows - start));
+#if INFLECT_PROFILE_VOCODER_OPS
+                const uint64_t quant_before = dot->input_quant_cycles + sources->input_quant_cycles;
+                const uint32_t gather_started = runtime_now_cycles();
+#endif
+                for (int row = 0; row < count; ++row) {
+                    for (int tap = 0; tap < taps; ++tap) {
+                        const int64_t source_t = first_source + start + row - tap;
+                        if (source_t < 0 || source_t >= x->ne[0]) {
+                            dot->store_zero_blocks(row, tap * tap_blocks, tap_blocks);
+                        } else {
+                            const int64_t source_index = source_t - cache_first;
+                            if (source_index < 0 || source_index >= source_capacity) return false;
+                            const int cache_index = leading / alignment_step * source_capacity + static_cast<int>(source_index);
+                            auto& ref = refs[cache_index];
+                            if (ref.tile < 0) {
+                            const char* input = static_cast<const char*>(x->data) +
+                                source_t * x->nb[0] + batch * x->nb[2];
+                            for (int c = 0; c < channels; ++c, input += x->nb[1])
+                                values[leading + c] = *reinterpret_cast<const float*>(input);
+#if INFLECT_PROFILE_VOCODER_OPS
+                            const uint64_t blocks_before = sources->profiled_zero_input_blocks;
+                            const uint64_t values_before = sources->profiled_zero_input_values;
+#endif
+                            sources->quantize_blocks(cache_index, 0, values, tap_blocks, true);
+#if INFLECT_PROFILE_VOCODER_OPS
+                            ref.zero_blocks = sources->profiled_zero_input_blocks - blocks_before;
+                            ref.zero_values = sources->profiled_zero_input_values - values_before;
+#endif
+                            ref.tile = 0;
+                            }
+                            dot->copy_blocks(row, tap * tap_blocks, cache_index, 0, tap_blocks
+#if INFLECT_PROFILE_VOCODER_OPS
+                                             , ref.zero_blocks, ref.zero_values
+#endif
+                                             , sources.get());
+                        }
+                    }
+                }
+#if INFLECT_PROFILE_VOCODER_OPS
+                const uint64_t elapsed = static_cast<uint32_t>(runtime_now_cycles() - gather_started);
+                const uint64_t quant = dot->input_quant_cycles + sources->input_quant_cycles - quant_before;
+                dot->input_gather_cycles += elapsed > quant ? elapsed - quant : 0;
+#endif
+                for (int64_t out = 0; out < dst->ne[1]; ++out) {
+                    const char* weight_row = static_cast<const char*>(weight->data) + out * weight->nb[1];
+                    const int8_t* cached_values = p->cached_values ? p->cached_values + out * full_elements : nullptr;
+                    const float* cached_scales = p->cached_scales ? p->cached_scales + out * (full_elements / 32) : nullptr;
+                    for (int tap = 0; tap < taps; ++tap) {
+                        const int original_block = (phase + tap * p->stride) * channels / 32;
+                        dot->unpack_weight(weight_row, cached_values, cached_scales,
+                                           original_block, tap_blocks, tap * tap_blocks);
+                    }
+                    dot->calculate(count);
+#if INFLECT_PROFILE_VOCODER_OPS
+                    const uint32_t write_started = runtime_now_cycles();
+#endif
+                    char* output = static_cast<char*>(dst->data) + batch * dst->nb[2] + out * dst->nb[1] +
+                        (first + start * p->stride) * dst->nb[0];
+                    dot->write_results(output, p->stride * dst->nb[0], count);
+#if INFLECT_PROFILE_VOCODER_OPS
+                    output_write_cycles += static_cast<uint32_t>(runtime_now_cycles() - write_started);
+#endif
+                }
+                runtime_cooperate();
+            }
+        }
+    }
+    }
+#if INFLECT_PROFILE_VOCODER_OPS
+    vocode_profile_add_packed(dot->input_gather_cycles, dot->reused_input_blocks,
+        dot->input_quant_cycles + sources->input_quant_cycles,
+        sources->input_max_cycles, sources->input_scale_cycles,
+        sources->input_convert_cycles, dot->q4_unpack_cycles, dot->s8_dot_cycles,
+        dot->scale_reduce_cycles, output_write_cycles);
+    vocode_profile_add_input_sparsity(p->profile_label, dot->profiled_input_blocks,
+        dot->profiled_zero_input_blocks, dot->profiled_input_values, dot->profiled_zero_input_values);
+#endif
+    return true;
+}
+
 static bool quant_conv_transpose1d_packed_op(
     ggml_tensor* dst,
     int ith,
@@ -2039,16 +2327,26 @@ static bool quant_conv_transpose1d_packed_op(
         return false;
     }
 
+    if (weight->type == GGML_TYPE_Q4_0 && runtime_has_s8_dot_blocks_32() &&
+        p->stride > 1 && p->stride <= 16 && p->kernel_size % p->stride == 0 &&
+        p->kernel_size / p->stride <= 4 && in_ch >= 24 && in_ch <= 256 &&
+        (in_ch * p->stride) % 32 == 0 &&
+        quant_conv_transpose_phase_op(dst, ith, nth, p, x, weight, packed.elements)) return true;
+
     VocoderInternalFloatScratch input_window;
     VocoderInternalByteScratch hot_input_block;
     VocoderInternalByteScratch source_cache_scratch;
     VocoderInternalByteScratch quantized_windows;
     VocoderInternalByteScratch weight_row;
     std::unique_ptr<Q4Q8TileDot> q4_dot;
-    const int time_tile = runtime_packed_quant_time_tile();
     const bool use_q4_dot =
         weight->type == GGML_TYPE_Q4_0 &&
         runtime_has_s8_dot_blocks_32();
+    const int64_t time_start = use_q4_dot ? (out_t * ith) / nth : 0;
+    const int64_t time_end = use_q4_dot ? (out_t * (ith + 1)) / nth : out_t;
+    if (time_start == time_end) return true;
+    const int time_tile = static_cast<int>(std::min<int64_t>(
+        runtime_packed_quant_time_tile(), time_end - time_start));
     const bool reuse_aligned_sources =
         use_q4_dot &&
         in_ch % kQ4BlockElements == 0;
@@ -2082,10 +2380,6 @@ static bool quant_conv_transpose1d_packed_op(
 
     // Match the Conv1d Q4 scheduling: each temporal window is gathered and
     // quantized by only one worker, while every output remains independent.
-    const int64_t time_start =
-        use_q4_dot ? (out_t * ith) / nth : 0;
-    const int64_t time_end =
-        use_q4_dot ? (out_t * (ith + 1)) / nth : out_t;
     const int64_t out_start =
         use_q4_dot ? 0 : (out_ch * ith) / nth;
     const int64_t out_end =
@@ -2205,7 +2499,9 @@ static bool quant_conv_transpose1d_packed_op(
                             } else {
                                 const int64_t first_block =
                                     writer.block_position();
-                                if (first_block < 0) {
+                                // Partial blocks are valid unless this source
+                                // will be reused through the whole-block cache.
+                                if (cached != nullptr && first_block < 0) {
                                     return false;
                                 }
 #if INFLECT_PROFILE_VOCODER_OPS
@@ -2313,7 +2609,9 @@ static bool quant_conv_transpose1d_packed_op(
                     static_cast<const char*>(weight->data) +
                     o * weight->nb[1];
                 if (use_q4_dot) {
-                    q4_dot->unpack_weight(source_weight);
+                    q4_dot->unpack_weight(source_weight,
+                        p->cached_values ? p->cached_values + o * packed.elements : nullptr,
+                        p->cached_scales ? p->cached_scales + o * (packed.elements / 32) : nullptr);
                     q4_dot->calculate(tile_count);
                 } else {
                     std::memcpy(
@@ -2321,14 +2619,19 @@ static bool quant_conv_transpose1d_packed_op(
                         source_weight,
                         weight_row_bytes);
                 }
-                for (int tile = 0;
+#if INFLECT_PROFILE_VOCODER_OPS
+                const uint32_t write_started = use_q4_dot ? runtime_now_cycles() : 0;
+#endif
+                if (use_q4_dot) {
+                    q4_dot->write_results(
+                        dst_data + tile_start * dst->nb[0] + o * dst->nb[1] + b * dst->nb[2],
+                        dst->nb[0], tile_count);
+                } else for (int tile = 0;
                      tile < tile_count;
                      ++tile) {
                     const int64_t t = tile_start + tile;
                     float value;
-                    if (use_q4_dot) {
-                        value = q4_dot->value(tile);
-                    } else {
+                    {
                         const void* quantized =
                             static_cast<const char*>(
                                 quantized_windows.data()) +
@@ -2351,22 +2654,12 @@ static bool quant_conv_transpose1d_packed_op(
                         t * dst->nb[0] +
                         o * dst->nb[1] +
                         b * dst->nb[2]);
-#if INFLECT_PROFILE_VOCODER_OPS
-                    if (use_q4_dot) {
-                        const uint32_t write_started =
-                            runtime_now_cycles();
-                        *output = value;
-                        output_write_cycles +=
-                            static_cast<uint32_t>(
-                                runtime_now_cycles() -
-                                write_started);
-                    } else {
-                        *output = value;
-                    }
-#else
                     *output = value;
-#endif
                 }
+#if INFLECT_PROFILE_VOCODER_OPS
+                if (use_q4_dot) output_write_cycles +=
+                    static_cast<uint32_t>(runtime_now_cycles() - write_started);
+#endif
             }
             runtime_cooperate();
         }
@@ -2533,6 +2826,269 @@ static ggml_tensor* quant_or_f16_conv_transpose_1d(
     return ggml_custom_4d(ctx, GGML_TYPE_F32, out_t, out_ch, x->ne[2], 1,
                           args, 2, quant_conv_transpose1d_op, GGML_N_TASKS_MAX, &op_data.back());
 }
+
+#if defined(INFLECT_LOW_MEMORY)
+// Sano retains small F16/F32 convolutions between quantized layers. GGML's
+// generic path materializes im2col (and rounds the input to F16). Accumulate
+// a short time strip in the LX7's internal task stack instead: each weight
+// conversion is reused across the strip and PSRAM accesses are sequential.
+static void sano_float_conv1d_op(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const uint32_t started = now_ms();
+    const auto* p = static_cast<const VocoderQuantConv1dOpData*>(userdata);
+    const ggml_tensor* x = dst->src[0];
+    const ggml_tensor* w = dst->src[1];
+    const ggml_tensor* bias = dst->src[2];
+    constexpr int tile = 32;
+    const int64_t strips = (dst->ne[0] + tile - 1) / tile;
+    const int64_t first = dst->ne[1] * strips * ith / nth;
+    const int64_t last = dst->ne[1] * strips * (ith + 1) / nth;
+    uint64_t outputs = 0;
+    for (int64_t b = 0; b < dst->ne[2]; ++b) {
+        // Split time as well as channels so mono post-convolution uses both cores.
+        for (int64_t job = first; job < last; ++job) {
+            const int64_t o = job / strips;
+            const int64_t start = (job % strips) * tile;
+            const float bias_value = bias ? tensor_get_f32(bias, o, 0, 0) : 0.0f;
+                const int count = static_cast<int>(std::min<int64_t>(tile, dst->ne[0] - start));
+                outputs += count;
+                float sums[tile];
+                std::fill_n(sums, count, bias_value);
+                for (int64_t c = 0; c < x->ne[1]; ++c) {
+                    for (int k = 0; k < p->kernel_size; ++k) {
+                        const float weight = tensor_get_f32(w, k, c, o);
+                        // Sano windows are int-sized; avoid software 64-bit
+                        // division in this per-coefficient Xtensa hot loop.
+                        const int origin = static_cast<int>(start) * p->stride + k * p->dilation - p->padding;
+                        const int begin = std::max(0, (-origin + p->stride - 1) / p->stride);
+                        const int end = std::min(count,
+                            (static_cast<int>(x->ne[0]) - origin + p->stride - 1) / p->stride);
+                        if (begin >= end) continue;
+                        const float* source = reinterpret_cast<const float*>(
+                            static_cast<const char*>(x->data) + c * x->nb[1] + b * x->nb[2]) +
+                            origin + begin * p->stride;
+                        for (int t = begin; t < end; ++t, source += p->stride) {
+                            sums[t] += weight * *source;
+                        }
+                    }
+                }
+                std::memcpy(static_cast<char*>(dst->data) + o * dst->nb[1] +
+                                b * dst->nb[2] + start * sizeof(float),
+                            sums, count * sizeof(float));
+                runtime_cooperate();
+        }
+    }
+    vocode_profile_add_conv1d(p->profile_label, now_ms() - started,
+                             outputs, outputs * x->ne[1] * p->kernel_size);
+}
+
+static void sano_float_transpose_op(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    const uint32_t started = now_ms();
+    const auto* p = static_cast<const QuantConvTranspose1dOpData*>(userdata);
+    const ggml_tensor* x = dst->src[0];
+    const ggml_tensor* w = dst->src[1];
+    constexpr int tile = 32;
+    const int64_t strips = (dst->ne[0] + tile - 1) / tile;
+    const int64_t first = dst->ne[1] * strips * ith / nth;
+    const int64_t last = dst->ne[1] * strips * (ith + 1) / nth;
+    uint64_t outputs = 0;
+    for (int64_t b = 0; b < dst->ne[2]; ++b) {
+        for (int64_t job = first; job < last; ++job) {
+                const int64_t o = job / strips;
+                const int64_t start = (job % strips) * tile;
+                const int count = static_cast<int>(std::min<int64_t>(tile, dst->ne[0] - start));
+                outputs += count;
+                float sums[tile] = {};
+                for (int64_t c = 0; c < x->ne[1]; ++c) {
+                    const float* source = reinterpret_cast<const float*>(
+                        static_cast<const char*>(x->data) + c * x->nb[1] + b * x->nb[2]);
+                    for (int k = 0; k < p->kernel_size; ++k) {
+                        const float weight = tensor_get_f32(w, k, o, c);
+                        const int origin = static_cast<int>(start) + p->crop_left - k;
+                        const int begin = std::max(0,
+                            (origin + p->stride - 1) / p->stride);
+                        const int end = std::min(static_cast<int>(x->ne[0]),
+                            (origin + count + p->stride - 1) / p->stride);
+                        // Visit only this kernel tap's stride phase; never
+                        // construct or multiply an upsampled zero-filled input.
+                        for (int t = begin; t < end; ++t) {
+                            sums[t * p->stride - origin] += weight * source[t];
+                        }
+                    }
+                }
+                std::memcpy(static_cast<char*>(dst->data) + o * dst->nb[1] +
+                                b * dst->nb[2] + start * sizeof(float),
+                            sums, count * sizeof(float));
+                runtime_cooperate();
+        }
+    }
+    vocode_profile_add_conv_transpose(p->profile_label, now_ms() - started,
+        outputs, outputs * x->ne[1] * p->kernel_size / p->stride);
+}
+#endif
+
+namespace packed_conv {
+
+static thread_local Q4WeightCache* active_weight_cache = nullptr;
+
+struct Q4WeightCache::Impl {
+    struct Entry {
+        const ggml_tensor* tensor;
+        void* allocation;
+        const int8_t* values;
+        const float* scales;
+    };
+    std::vector<Entry> entries;
+    size_t budget = 0;
+    size_t bytes = 0;
+    size_t hits = 0;
+};
+
+Q4WeightCache::Q4WeightCache(size_t budget)
+    : impl_(new (std::nothrow) Impl()), previous_(active_weight_cache) {
+    if (impl_) impl_->budget = budget;
+    active_weight_cache = this;
+}
+
+Q4WeightCache::~Q4WeightCache() {
+    clear();
+    active_weight_cache = previous_;
+}
+
+void Q4WeightCache::clear() {
+    if (!impl_) return;
+    if (impl_->bytes) {
+        std::fprintf(stderr, "[SanoQ4Cache] tensors=%zu bytes=%zu reuse_hits=%zu\n",
+                     impl_->entries.size(), impl_->bytes, impl_->hits);
+    }
+    for (const auto& entry : impl_->entries) runtime_free_scratch(entry.allocation);
+    impl_->entries.clear();
+    impl_->bytes = 0;
+    impl_->hits = 0;
+}
+
+void Q4WeightCache::get(const ggml_tensor* weight, const int8_t*& values, const float*& scales) {
+    values = nullptr;
+    scales = nullptr;
+#if defined(INFLECT_LOW_MEMORY)
+    if (!impl_ || weight->type != GGML_TYPE_Q4_0 ||
+        !runtime_has_s8_dot_blocks_32()) return;
+    for (const auto& entry : impl_->entries) {
+        if (entry.tensor == weight) {
+            values = entry.values;
+            scales = entry.scales;
+            ++impl_->hits;
+            return;
+        }
+    }
+    const size_t count = static_cast<size_t>(ggml_nelements(weight));
+    const size_t blocks = count / 32;
+    const size_t bytes = count + blocks * sizeof(float) + 15;
+    if (bytes > impl_->budget - impl_->bytes) return;
+    void* allocation = runtime_alloc_scratch(bytes, ScratchMemoryKind::Psram);
+    if (!allocation) return; // Cache is optional; retain the original kernel.
+    auto* unpacked = reinterpret_cast<int8_t*>(
+        (reinterpret_cast<uintptr_t>(allocation) + 15) & ~uintptr_t(15));
+    auto* decoded_scales = reinterpret_cast<float*>(unpacked + count);
+    // Decode once into PSRAM using scalar stores. SIMD operands are copied to
+    // the existing aligned internal row buffers before invoking PIE assembly.
+    for (int64_t row = 0; row < weight->ne[1]; ++row) {
+        const auto* source = reinterpret_cast<const PackedQ4Block*>(
+            static_cast<const char*>(weight->data) + row * weight->nb[1]);
+        for (int64_t block = 0; block < weight->ne[0] / 32; ++block) {
+            const size_t index = row * (weight->ne[0] / 32) + block;
+            decoded_scales[index] = ggml_fp16_to_fp32(source[block].scale);
+            for (int k = 0; k < 16; ++k) {
+                unpacked[index * 32 + k] = (source[block].quants[k] & 15) - 8;
+                unpacked[index * 32 + k + 16] = (source[block].quants[k] >> 4) - 8;
+            }
+        }
+    }
+    impl_->entries.push_back({weight, allocation, unpacked, decoded_scales});
+    impl_->bytes += bytes;
+    values = unpacked;
+    scales = decoded_scales;
+#else
+    (void)weight;
+#endif
+}
+
+void profile_reset() { vocode_profile_reset(); }
+void profile_log(uint32_t elapsed_ms) { vocode_profile_log(elapsed_ms); }
+
+ggml_tensor* conv1d(
+    ggml_context* ctx,
+    ggml_tensor* weight,
+    ggml_tensor* bias,
+    ggml_tensor* input,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation,
+    std::vector<VocoderQuantConv1dOpData>& op_data,
+    const char* profile_label
+) {
+#if defined(INFLECT_LOW_MEMORY)
+    if ((weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_F32) &&
+        input->type == GGML_TYPE_F32 && input->nb[0] == sizeof(float)) {
+        const int64_t frames = (input->ne[0] + 2 * padding -
+            dilation * (kernel_size - 1) - 1) / stride + 1;
+        op_data.push_back({profile_label, kernel_size, stride, padding, dilation});
+        ggml_tensor* args[] = {input, weight, bias};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, frames, weight->ne[2], input->ne[2], 1,
+            args, bias ? 3 : 2, sano_float_conv1d_op, GGML_N_TASKS_MAX, &op_data.back());
+    }
+#endif
+    ggml_tensor* result = conv1d_vocoder(
+        ctx, weight, bias, input, kernel_size, stride, padding, dilation,
+        true, op_data, profile_label);
+#if defined(INFLECT_LOW_MEMORY)
+    if (active_weight_cache && ggml_is_quantized(weight->type)) {
+        active_weight_cache->get(weight, op_data.back().cached_values, op_data.back().cached_scales);
+    }
+#endif
+    return result;
+}
+
+ggml_tensor* conv_transpose1d(
+    ggml_context* ctx,
+    ggml_tensor* weight,
+    ggml_tensor* input,
+    int kernel_size,
+    int stride,
+    int padding,
+    std::vector<QuantConvTranspose1dOpData>& op_data,
+    const char* profile_label
+) {
+#if defined(INFLECT_LOW_MEMORY)
+    if ((weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_F32) &&
+        input->type == GGML_TYPE_F32 && input->nb[0] == sizeof(float)) {
+        const int64_t frames = (input->ne[0] - 1) * stride + kernel_size - 2 * padding;
+        op_data.push_back({profile_label, kernel_size, stride, padding});
+        ggml_tensor* args[] = {input, weight};
+        return ggml_custom_4d(ctx, GGML_TYPE_F32, frames, weight->ne[1], input->ne[2], 1,
+            args, 2, sano_float_transpose_op, GGML_N_TASKS_MAX, &op_data.back());
+    }
+#endif
+    ggml_tensor* result = quant_or_f16_conv_transpose_1d(
+        ctx, weight, input, kernel_size, stride, padding, op_data,
+        profile_label);
+#if defined(INFLECT_LOW_MEMORY)
+    if (active_weight_cache && ggml_is_quantized(weight->type)) {
+        active_weight_cache->get(weight, op_data.back().cached_values, op_data.back().cached_scales);
+    }
+#endif
+    return result;
+}
+
+ggml_tensor* add_channel_bias(
+    ggml_context* ctx,
+    ggml_tensor* input,
+    ggml_tensor* bias
+) {
+    return ::inflect::add_channel_bias(ctx, input, bias);
+}
+
+} // namespace packed_conv
 
 // ═════════════════════════════════════════════════════════════════════════
 // Construction

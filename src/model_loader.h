@@ -24,6 +24,8 @@ public:
     bool open(const std::string& path);
     bool select(const std::vector<std::string>& prefixes);
     void release_selected();
+    // Optional bounded cache for small models; larger models stay stage-loaded.
+    bool cache_weights(size_t max_bytes);
 
     // ── Tensor access ──────────────────────────────────────────────
     ggml_tensor* get_tensor(const std::string& name) const;
@@ -52,6 +54,7 @@ private:
     std::FILE*            file_   = nullptr;
     std::string           path_;
     std::vector<ggml_tensor*> selected_tensors_;
+    bool cached_weights_ = false;
 };
 
 } // namespace inflect

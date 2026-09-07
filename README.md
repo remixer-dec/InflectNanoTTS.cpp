@@ -1,12 +1,13 @@
-# InflectNanoTTS.cpp
+# InflectSanoTTS.cpp
 
-Small C++/GGML port of the
+Small C++/GGML runtime for
 [Inflect-Nano TTS v1](https://huggingface.co/owensong/Inflect-Nano-v1),
 [Inflect-Nano TTS v2](https://huggingface.co/owensong/Inflect-Nano-v2/), and
 [Inflect-Micro TTS v2](https://huggingface.co/owensong/Inflect-Micro-v2/)
-pipelines.
+pipelines, plus the [sanoTTS](https://github.com/Ampixa/sanoTTS)
+Piperlite architecture.
 
-This repo contains the runtime, conversion helpers, and parity/debug tooling. Currently only CPU inference is supported.
+This repo contains the runtime, conversion helpers, and parity/debug tooling. CPU inference is supported, including the low-memory ESP32-S3 path.
 Pre-quantized weights are available here:
 [V1-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v1-GGUF),
 [V2-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v2-GGUF), and
@@ -20,6 +21,8 @@ Pre-quantized weights are available here:
 - `tools/convert_v2.py`: v2 checkpoint conversion and GGUF quantization
 - `tools/compile_cmudict.py`: compile `cmudict.rep` into `cmudict.bin`
 - `tools/compile-v2-lexicon.py`: compile the v2 eSpeak lexicon into `lexicon.bin`
+- `tools/convert_sano.py`: convert a canonical sanoTTS Piperlite GGUF
+- `tools/compile-sano-lexicon.py`: compile a Piper phoneme lexicon for Sano
 - `ggml/`: vendored GGML submodule
 
 ## Build
@@ -109,6 +112,41 @@ full learned variance. `--seed` makes synthesis deterministic.
 comma-separated list of unblanked token IDs. The runtime inserts blank token
 `0` between them, which is useful for testing exact pronunciations or frontend
 output.
+
+## Sano Piperlite
+
+InflectSano supports the Piperlite graph from
+[sanoTTS](https://github.com/Ampixa/sanoTTS). This support is for Piperlite;
+the separate Sano Heart/Nano architecture is not part of this runtime.
+
+Conversion and lexicon generation run on the host. The converter needs Python,
+NumPy, and the `gguf` package. Lexicon generation also needs the host eSpeak
+and phonemizer dependencies used by sanoTTS.
+
+Convert the canonical Sano Piperlite GGUF and compile its runtime lexicon:
+
+```bash
+python3 tools/convert_sano.py \
+  --input /path/to/canonical-sano-piperlite.gguf \
+  --config /path/to/manifest.json \
+  --phoneme-config /path/to/piper-phoneme-config.json \
+  --output /path/to/sano_piperlite.gguf \
+  --quantize q4_0_e
+
+python3 tools/compile-sano-lexicon.py \
+  --phoneme-config /path/to/piper-phoneme-config.json \
+  --cmudict /path/to/cmudict.bin \
+  --format snl2 \
+  --output /path/to/sano_lexicon.snl
+```
+
+Use the existing build and run instructions above with these Sano-specific
+options:
+
+- `--model-family sano`: select the Sano Piperlite runtime
+- `--sano-model /path/to/sano_piperlite.gguf`: load the converted model
+- `--sano-lexicon /path/to/sano_lexicon.snl`: load the compiled lexicon
+- `--speaking-rate 1.0`: set the Sano speaking rate
 
 ### Griffin-Lim backend
 

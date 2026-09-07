@@ -53,11 +53,14 @@ int main(int argc, char** argv) {
     std::string model_family = "v1";
     std::string v2_model_path;
     std::string v2_lexicon_path;
+    std::string sano_model_path = "sano_piperlite.gguf";
+    std::string sano_lexicon_path = "sano_lexicon.snl";
     std::string token_file;
     std::string noise_file;
     bool tokens_blanked = false;
     float v2_speed = 1.0f;
     float v2_variation = 0.667f;
+    float sano_speaking_rate = 1.0f;
     uint64_t seed = 1234;
     int decoder_chunk_frames = 32;
     int n_threads = -1;
@@ -115,6 +118,13 @@ int main(int argc, char** argv) {
             model_family = "v2";
         } else if (arg == "--v2-lexicon" && i + 1 < argc) {
             v2_lexicon_path = argv[++i];
+        } else if (arg == "--sano-model" && i + 1 < argc) {
+            sano_model_path = argv[++i];
+            model_family = "sano";
+        } else if (arg == "--sano-lexicon" && i + 1 < argc) {
+            sano_lexicon_path = argv[++i];
+        } else if (arg == "--speaking-rate" && i + 1 < argc) {
+            sano_speaking_rate = std::strtof(argv[++i], nullptr);
         } else if (arg == "--speed" && i + 1 < argc) {
             v2_speed = std::strtof(argv[++i], nullptr);
         } else if (arg == "--variation" && i + 1 < argc) {
@@ -131,8 +141,11 @@ int main(int argc, char** argv) {
             tokens_blanked = true;
         }
     }
-    if (model_family != "v1" && model_family != "v2") {
-        fprintf(stderr, "Unsupported model family '%s'; expected v1 or v2\n",
+    if (model_family == "piperlite") model_family = "sano";
+    if (model_family != "v1" && model_family != "v2" &&
+        model_family != "sano") {
+        fprintf(stderr,
+                "Unsupported model family '%s'; expected v1, v2, or sano\n",
                 model_family.c_str());
         return 1;
     }
@@ -258,6 +271,31 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(params.seed));
         if (!write_wav(output_path, audio, synth.sample_rate())) {
             fprintf(stderr, "Failed to write %s\n", output_path.c_str());
+            return 1;
+        }
+        fprintf(stderr, "Wrote %s\n", output_path.c_str());
+        Synthesizer::free_backend();
+        return 0;
+    }
+
+    if (model_family == "sano") {
+        if (!synth.load_sano(sano_model_path, sano_lexicon_path)) {
+            fprintf(stderr, "Failed to load Sano Piperlite assets\n");
+            Synthesizer::free_backend();
+            return 1;
+        }
+        SanoSynthParams params;
+        params.speaking_rate = sano_speaking_rate;
+        fprintf(stderr, "Synthesizing Sano Piperlite: %s\n", text.c_str());
+        const std::vector<float> audio = synth.synthesize_sano(text, params);
+        fprintf(stderr,
+                "Generated Sano %zu samples (%.2f seconds) rate=%d\n",
+                audio.size(),
+                static_cast<float>(audio.size()) / synth.sample_rate(),
+                synth.sample_rate());
+        if (!write_wav(output_path, audio, synth.sample_rate())) {
+            fprintf(stderr, "Failed to write %s\n", output_path.c_str());
+            Synthesizer::free_backend();
             return 1;
         }
         fprintf(stderr, "Wrote %s\n", output_path.c_str());

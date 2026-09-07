@@ -36,6 +36,8 @@ struct QuantConvTranspose1dOpData {
     int kernel_size;
     int stride;
     int crop_left;
+    const int8_t* cached_values = nullptr;
+    const float* cached_scales = nullptr;
 };
 
 struct VocoderQuantConv1dOpData {
@@ -44,7 +46,62 @@ struct VocoderQuantConv1dOpData {
     int stride;
     int padding;
     int dilation;
+    const int8_t* cached_values = nullptr;
+    const float* cached_scales = nullptr;
 };
+
+// Shared convolution entry points used by both the original HiFi-GAN
+// vocoder and the Sano Piperlite decoder.  Keeping these declarations here
+// makes Sano use the same quantized/ESP32 paths as the existing vocoder.
+namespace packed_conv {
+
+void profile_reset();
+void profile_log(uint32_t elapsed_ms);
+
+// Scoped to graph construction and execution on one synthesis thread. Workers
+// receive immutable cache pointers in their op data; weights stay stage-local.
+class Q4WeightCache {
+public:
+    explicit Q4WeightCache(size_t budget = 256 * 1024);
+    ~Q4WeightCache();
+    Q4WeightCache(const Q4WeightCache&) = delete;
+    Q4WeightCache& operator=(const Q4WeightCache&) = delete;
+    void clear();
+    void get(const ggml_tensor* weight, const int8_t*& values, const float*& scales);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    Q4WeightCache* previous_ = nullptr;
+};
+
+ggml_tensor* conv1d(
+    ggml_context* ctx,
+    ggml_tensor* weight,
+    ggml_tensor* bias,
+    ggml_tensor* input,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation,
+    std::vector<VocoderQuantConv1dOpData>& op_data,
+    const char* profile_label);
+
+ggml_tensor* conv_transpose1d(
+    ggml_context* ctx,
+    ggml_tensor* weight,
+    ggml_tensor* input,
+    int kernel_size,
+    int stride,
+    int padding,
+    std::vector<QuantConvTranspose1dOpData>& op_data,
+    const char* profile_label);
+
+ggml_tensor* add_channel_bias(
+    ggml_context* ctx,
+    ggml_tensor* input,
+    ggml_tensor* bias);
+
+} // namespace packed_conv
 
 class VocoderModel {
 public:

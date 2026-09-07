@@ -105,7 +105,29 @@ void ModelLoader::release_weights() {
 }
 
 void ModelLoader::release_selected() {
-    release_weights();
+    if (!cached_weights_) release_weights();
+}
+
+bool ModelLoader::cache_weights(size_t max_bytes) {
+    if (cached_weights_) return true;
+    if (!gguf_ || !ctx_ || !file_) return false;
+    const auto buft = runtime_weight_buffer_type();
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t bytes = 0;
+    for (int i = 0; i < gguf_get_n_tensors(gguf_); ++i) {
+        const auto* tensor = ggml_get_tensor(ctx_, gguf_get_tensor_name(gguf_, i));
+        bytes = align_up(bytes, alignment);
+        const size_t size = ggml_backend_buft_get_alloc_size(buft, tensor);
+        if (bytes > max_bytes || size > max_bytes - bytes) return false;
+        bytes += size;
+    }
+    if (!select({})) {
+        release_weights();
+        return false;
+    }
+    cached_weights_ = true;
+    std::fprintf(stderr, "[ModelLoader] cached weights bytes=%zu\n", bytes);
+    return true;
 }
 
 bool ModelLoader::select(const std::vector<std::string>& prefixes) {
@@ -113,6 +135,7 @@ bool ModelLoader::select(const std::vector<std::string>& prefixes) {
         fprintf(stderr, "[ModelLoader] Cannot select tensors before opening GGUF\n");
         return false;
     }
+    if (cached_weights_) return true;
 
     const uint32_t started_ms = runtime_now_ms();
     const std::vector<std::string>* selected_prefixes = prefixes.empty() ? nullptr : &prefixes;

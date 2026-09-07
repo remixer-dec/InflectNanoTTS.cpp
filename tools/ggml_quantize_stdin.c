@@ -28,6 +28,8 @@ static int64_t local_block_size(enum ggml_type type) {
             return 256;
         case GGML_TYPE_Q1_0:
             return 128;
+        case GGML_TYPE_Q2_0:
+            return 64;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -46,6 +48,7 @@ size_t ggml_type_size(enum ggml_type type) {
         case GGML_TYPE_Q5_K: return 176;
         case GGML_TYPE_Q6_K: return 210;
         case GGML_TYPE_Q1_0: return 18;
+        case GGML_TYPE_Q2_0: return 18;
         case GGML_TYPE_Q4_0: return 18;
         case GGML_TYPE_Q4_1: return 24;
         case GGML_TYPE_Q5_0: return 22;
@@ -66,6 +69,7 @@ const char * ggml_type_name(enum ggml_type type) {
         case GGML_TYPE_Q5_K: return "q5_K";
         case GGML_TYPE_Q6_K: return "q6_K";
         case GGML_TYPE_Q1_0: return "q1_0";
+        case GGML_TYPE_Q2_0: return "q2_0";
         case GGML_TYPE_Q4_0: return "q4_0";
         case GGML_TYPE_Q4_1: return "q4_1";
         case GGML_TYPE_Q5_0: return "q5_0";
@@ -77,6 +81,7 @@ const char * ggml_type_name(enum ggml_type type) {
 static enum ggml_type parse_type(const char * name) {
     if (strcmp(name, "q1_0") == 0) return GGML_TYPE_Q1_0;
     if (strcmp(name, "q1_k") == 0) return GGML_TYPE_Q1_0;
+    if (strcmp(name, "q2_0") == 0) return GGML_TYPE_Q2_0;
     if (strcmp(name, "q2_k") == 0) return GGML_TYPE_Q2_K;
     if (strcmp(name, "q3_k") == 0) return GGML_TYPE_Q3_K;
     if (strcmp(name, "q4_k") == 0) return GGML_TYPE_Q4_K;
@@ -97,6 +102,7 @@ static size_t quantize_rows(enum ggml_type type, const float * input, void * out
         case GGML_TYPE_Q5_K: return quantize_q5_K(input, output, rows, cols, NULL);
         case GGML_TYPE_Q6_K: return quantize_q6_K(input, output, rows, cols, NULL);
         case GGML_TYPE_Q1_0: return quantize_q1_0(input, output, rows, cols, NULL);
+        case GGML_TYPE_Q2_0: return quantize_q2_0(input, output, rows, cols, NULL);
         case GGML_TYPE_Q4_0: return quantize_q4_0(input, output, rows, cols, NULL);
         case GGML_TYPE_Q4_1: return quantize_q4_1(input, output, rows, cols, NULL);
         case GGML_TYPE_Q5_0: return quantize_q5_0(input, output, rows, cols, NULL);
