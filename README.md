@@ -10,11 +10,9 @@ Piperlite architecture.
 This repo contains the runtime, conversion helpers, and parity/debug tooling. CPU inference is supported, including the low-memory ESP32-S3 path.
 Pre-quantized weights are available here:
 [V1-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v1-GGUF),
-[V2-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v2-GGUF), and
-[V2-Micro](https://huggingface.co/remixerdec/Inflect-Micro-v2-GGUF).
-Sano Piperlite voice quants and audio samples are available in the
-[SanoTTS-GGUF release](https://huggingface.co/remixerdec/SanoTTS-GGUF), which
-includes Amy, Amy-small, HFC, Kristin, Vietnamese, and Indonesian voices.
+[V2-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v2-GGUF),
+[V2-Micro](https://huggingface.co/remixerdec/Inflect-Micro-v2-GGUF), and
+[SanoTTS-GGUF](https://huggingface.co/remixerdec/SanoTTS-GGUF).
 
 ## Layout
 
