@@ -12,6 +12,9 @@ Pre-quantized weights are available here:
 [V1-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v1-GGUF),
 [V2-Nano](https://huggingface.co/remixerdec/Inflect-Nano-v2-GGUF), and
 [V2-Micro](https://huggingface.co/remixerdec/Inflect-Micro-v2-GGUF).
+Sano Piperlite voice quants and audio samples are available in the
+[SanoTTS-GGUF release](https://huggingface.co/remixerdec/SanoTTS-GGUF), which
+includes Amy, Amy-small, HFC, Kristin, Vietnamese, and Indonesian voices.
 
 ## Layout
 
@@ -34,7 +37,7 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
-Both CMake and `tools/build.sh` place the CLI binary under `build/<os>-<arch>/inflect-nano`.
+Both CMake and `tools/build.sh` place the CLI binary under `build/<os>-<arch>/inflect-sano`.
 
 With the fallback script:
 
@@ -75,7 +78,7 @@ git -C ggml diff --binary > patches/ggml/0001-esp32-low-memory-support.patch
 The CLI expects explicit asset paths:
 
 ```bash
-./build/<os>-<arch>/inflect-nano \
+./build/<os>-<arch>/inflect-sano \
   -a /path/to/inflect_acoustic.gguf \
   -v /path/to/inflect_vocoder.gguf \
   -d /path/to/cmudict.bin \
@@ -93,7 +96,7 @@ release's `config.json`. Runtime inference never reads a PyTorch checkpoint or
 configuration JSON.
 
 ```bash
-./build/<os>-<arch>/inflect-nano \
+./build/<os>-<arch>/inflect-sano \
   --model-family v2 \
   --v2-model /path/to/inflect_nano_v2_f32.gguf \
   --v2-lexicon /path/to/lexicon.bin \
@@ -126,14 +129,14 @@ and phonemizer dependencies used by sanoTTS.
 Convert the canonical Sano Piperlite GGUF and compile its runtime lexicon:
 
 ```bash
-python3 tools/convert_sano.py \
+python tools/convert_sano.py \
   --input /path/to/canonical-sano-piperlite.gguf \
   --config /path/to/manifest.json \
   --phoneme-config /path/to/piper-phoneme-config.json \
   --output /path/to/sano_piperlite.gguf \
   --quantize q4_0_e
 
-python3 tools/compile-sano-lexicon.py \
+python tools/compile-sano-lexicon.py \
   --phoneme-config /path/to/piper-phoneme-config.json \
   --cmudict /path/to/cmudict.bin \
   --format snl2 \

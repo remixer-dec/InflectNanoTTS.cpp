@@ -705,13 +705,21 @@ std::vector<float> Synthesizer::synthesize_sano(
     fprintf(stderr, "[SanoStage] frontend tokens=%zu elapsed_ms=%u\n",
             frontend.tokens.size(),
             static_cast<unsigned>(runtime_now_ms() - frontend_started));
-    if (!frontend.ok || frontend.tokens.empty()) {
-        fprintf(stderr, "[Synthesizer] Sano frontend produced no tokens\n");
-        return {};
+    for (const auto& word : frontend.approximated_words) {
+        fprintf(stderr, "[SanoFrontend] OOV pronunciation fallback: %s\n", word.c_str());
     }
-    if (!frontend.oov_words.empty()) {
-        fprintf(stderr, "[Synthesizer] Sano frontend skipped %zu OOV word(s)\n",
-                frontend.oov_words.size());
+    for (const auto& word : frontend.spelled_words) {
+        fprintf(stderr, "[SanoFrontend] OOV spelling fallback: %s\n", word.c_str());
+    }
+    for (const auto& word : frontend.unpronounceable_words) {
+        fprintf(stderr,
+                "[SanoFrontend] cannot spell OOV word '%s'; rebuild the lexicon "
+                "with alphabet coverage or add the word with --text/--supplemental\n",
+                word.c_str());
+    }
+    if (!frontend.ok || frontend.tokens.empty()) {
+        fprintf(stderr, "[Synthesizer] Sano frontend failed; audio not generated\n");
+        return {};
     }
 
     const uint32_t started_ms = runtime_now_ms();

@@ -50,7 +50,7 @@ def normalized_arch():
 
 
 def default_binary_path(tts_dir):
-    return tts_dir / "build" / f"{normalized_os()}-{normalized_arch()}" / "inflect-nano"
+    return tts_dir / "build" / f"{normalized_os()}-{normalized_arch()}" / "inflect-sano"
 
 
 def acquire_lock(out_dir):
@@ -436,7 +436,7 @@ def main(argv=None):
     parser.add_argument("--keep-going", action="store_true", help="Continue after failed cases.")
     parser.add_argument("--list-layers", action="store_true", help="Print selected acoustic layers and exit.")
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1), help="Number of pair cases to run concurrently.")
-    parser.add_argument("--tts-threads", type=int, default=1, help="GGML CPU threads per inflect-nano inference process.")
+    parser.add_argument("--tts-threads", type=int, default=1, help="GGML CPU threads per inflect-sano inference process.")
     parser.add_argument("--progress-interval", type=float, default=10.0, help="Seconds between progress heartbeat lines while jobs are running.")
     parser.add_argument("--delete-case-models", action="store_true", help="Delete per-case GGUF files after each inference; keeps WAV, log, and result rows.")
     parser.add_argument("--no-reuse-vocoder", action="store_true", help="Reconvert the vocoder for every pair case instead of reusing the baseline vocoder.")
@@ -456,7 +456,7 @@ def main(argv=None):
     if args.build:
         run(["./tools/build.sh"], tts_dir)
     if not binary.exists():
-        raise FileNotFoundError(f"missing inflect-nano executable: {binary}")
+        raise FileNotFoundError(f"missing inflect-sano executable: {binary}")
 
     layers = select_layers(args.acoustic, split_csv(args.layers))
     if args.list_layers:

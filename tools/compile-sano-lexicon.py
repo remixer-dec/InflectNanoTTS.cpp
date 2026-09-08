@@ -35,6 +35,7 @@ from sano_common import (
     read_cmd2_words,
 )
 from v2_common import canonical_json
+from sano_g2p import phonetic_units
 
 
 FNV_OFFSET = 14695981039346656037
@@ -213,6 +214,7 @@ def collect_words(
     word_lists: list[Path],
     supplementals: list[Path],
     language: str,
+    texts: list[str] | None = None,
 ) -> list[str]:
     words: set[str] = set()
     if cmudict is not None:
@@ -233,6 +235,15 @@ def collect_words(
                         or ""
                     )
                 words.update(extract_words(line))
+    for text in texts or []:
+        words.update(extract_words(text))
+    # The runtime spells OOV words using character pronunciations in this voice.
+    words.update("abcdefghijklmnopqrstuvwxyz0123456789")
+    if language == "vi":
+        # Vietnamese vowel/letter variants, including uppercase and tone marks.
+        letters = "ăâđêôơưáàảãạéèẻẽẹíìỉĩịóòỏõọúùủũụýỳỷỹỵ"
+        letters += "".join(chr(codepoint) for codepoint in range(0x1ea0, 0x1efa))
+        words.update(runtime_word_key(char) for char in letters + letters.upper())
     if language == "en":
         # Runtime OOV spelling uses these names.  Keeping them in the same
         # voice lexicon avoids a second symbol/pronunciation table.
@@ -512,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="optional compiled CMD2/legacy CMU word source")
     parser.add_argument("--word-list", type=Path, action="append", default=[])
     parser.add_argument("--supplemental", type=Path, action="append", default=[])
+    parser.add_argument("--text", action="append", default=[],
+                        help="include words from this text (repeatable)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--format", "-format", choices=("snl1", "snl2"), default="snl2",
@@ -523,8 +536,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-map-hash")
     args = parser.parse_args(argv)
 
-    if args.cmudict is None and not args.word_list and not args.supplemental:
-        parser.error("provide --cmudict, --word-list, or --supplemental")
+    if args.cmudict is None and not args.word_list and not args.supplemental and not args.text:
+        parser.error("provide --cmudict, --word-list, --supplemental, or --text")
     id_map, espeak_voice, language = load_config(args.phoneme_config)
     frontend_hash = map_hash(id_map)
     if (args.format == "snl1" and args.expected_map_hash and
@@ -535,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     words = collect_words(
-        args.cmudict, args.word_list, args.supplemental, language
+        args.cmudict, args.word_list, args.supplemental, language, args.text
     )
     backend = make_backend(espeak_voice)
     pronunciations = phonemize_words(backend, words, args.jobs)
@@ -553,6 +566,8 @@ def main(argv: list[str] | None = None) -> int:
             entries.append((word, encoded))
         else:
             skipped.append(word)
+    units = phonetic_units(language, id_map)
+    entries.extend(units)
     if args.format == "snl2":
         bucket_count, block_count, blob_bytes = write_snl2(
             entries, args.output, language, frontend_hash
@@ -572,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
         "phoneme_map_hash": frontend_hash,
         "entry_count": len(entries),
         "source_word_count": len(words),
+        "phonetic_unit_count": len(units),
         "bucket_count": bucket_count,
         "block_count": block_count,
         "load_factor": len(entries) / bucket_count,

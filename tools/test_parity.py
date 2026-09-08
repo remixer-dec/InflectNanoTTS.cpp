@@ -65,7 +65,7 @@ def normalized_arch() -> str:
 
 
 def default_binary_path(tts_dir: Path) -> Path:
-    return tts_dir / "build" / f"{normalized_os()}-{normalized_arch()}" / "inflect-nano"
+    return tts_dir / "build" / f"{normalized_os()}-{normalized_arch()}" / "inflect-sano"
 
 
 def clone_reference(repo_url: str, ref_dir: Path, refresh: bool) -> None:
@@ -160,8 +160,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--work-dir", type=Path, default=Path("build/parity"))
     parser.add_argument("--text", default=TEXT)
     parser.add_argument("--speaker", default="mark")
-    parser.add_argument("--binary", type=Path, default=None, help="Use this inflect-nano executable instead of the default build/<os>-<arch>/inflect-nano.")
-    parser.add_argument("--skip-build", action="store_true", help="Do not run tools/build.sh; requires an existing --binary or default build/<os>-<arch>/inflect-nano.")
+    parser.add_argument("--binary", type=Path, default=None, help="Use this inflect-sano executable instead of the default build/<os>-<arch>/inflect-sano.")
+    parser.add_argument("--skip-build", action="store_true", help="Do not run tools/build.sh; requires an existing --binary or default build/<os>-<arch>/inflect-sano.")
     parser.add_argument("--refresh", action="store_true", help="Delete and reclone the reference repo.")
     parser.add_argument("--keep-going", action="store_true", help="Print all diagnostics before returning failure.")
     parser.add_argument("--min-acoustic-cosine", type=float, default=0.99999)
@@ -234,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_build:
         run(["./tools/build.sh"], cwd=tts_dir)
     if not binary.exists():
-        raise FileNotFoundError(f"missing inflect-nano executable: {binary}")
+        raise FileNotFoundError(f"missing inflect-sano executable: {binary}")
 
     run(
         [

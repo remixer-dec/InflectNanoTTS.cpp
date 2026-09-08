@@ -93,35 +93,15 @@ bool ascii_digit(char value) {
     return value >= '0' && value <= '9';
 }
 
+bool ascii_vowel(char value) {
+    value = ascii_lower(value);
+    return value == 'a' || value == 'e' || value == 'i' || value == 'o' ||
+           value == 'u' || value == 'y';
+}
+
 bool ascii_word_byte(unsigned char value) {
     return value >= 0x80 || ascii_alpha(static_cast<char>(value)) ||
            ascii_digit(static_cast<char>(value));
-}
-
-bool word_boundary_before(std::string_view text, size_t pos) {
-    return pos == 0 || !ascii_word_byte(static_cast<unsigned char>(text[pos - 1]));
-}
-
-bool word_boundary_after(std::string_view text, size_t pos) {
-    return pos >= text.size() ||
-           !ascii_word_byte(static_cast<unsigned char>(text[pos]));
-}
-
-void replace_word_ci(std::string& text, std::string_view from,
-                     std::string_view to) {
-    for (size_t pos = 0; pos + from.size() <= text.size();) {
-        bool match = word_boundary_before(text, pos) &&
-                     word_boundary_after(text, pos + from.size());
-        for (size_t index = 0; match && index < from.size(); ++index) {
-            match = ascii_lower(text[pos + index]) == ascii_lower(from[index]);
-        }
-        if (match) {
-            text.replace(pos, from.size(), to);
-            pos += to.size();
-        } else {
-            ++pos;
-        }
-    }
 }
 
 uint64_t hash_word(std::string_view word) {
@@ -531,6 +511,128 @@ bool SanoFrontend::spell_ascii_word(
     return any;
 }
 
+bool SanoFrontend::pronounce_word(
+    std::string_view word,
+    const SanoPiperConfig& config,
+    std::vector<uint8_t>& ids
+) const {
+    ids.clear();
+    if (word.size() < 2 || word.size() > 255) return false;
+    bool has_vowel = false;
+    bool capitals = true;
+    for (char value : word) {
+        if (!ascii_alpha(value)) return false;
+        has_vowel |= ascii_vowel(value);
+        capitals &= value >= 'A' && value <= 'Z';
+    }
+    // Short all-capital tokens and consonant-only tokens are safer to spell.
+    if (!has_vowel || (capitals && word.size() <= 5)) return false;
+
+    // Find a complete decomposition into known word fragments, preferring the
+    // fewest pieces. Single-letter entries are letter names, not word sounds.
+    const size_t count = word.size();
+    std::vector<int> cost(count + 1, INT_MAX);
+    std::vector<size_t> next(count + 1, count);
+    std::vector<uint8_t> part;
+    cost[count] = 0;
+    for (size_t start = count; start-- > 0;) {
+        for (size_t end = std::min(count, start + max_word_bytes_);
+             end > start + 1; --end) {
+            if (cost[end] == INT_MAX || cost[end] + 1 >= cost[start]) continue;
+            const auto fragment = word.substr(start, end - start);
+            if (!std::any_of(fragment.begin(), fragment.end(), ascii_vowel)) continue;
+            if (lookup(fragment, part)) {
+                cost[start] = cost[end] + 1;
+                next[start] = end;
+            }
+        }
+    }
+    if (cost[0] != INT_MAX) {
+        for (size_t start = 0; start < count; start = next[start]) {
+            if (!lookup(word.substr(start, next[start] - start), part)) {
+                ids.clear();
+                return false;
+            }
+            append_ids(ids, part);
+        }
+        return true;
+    }
+
+    // Phonetic units contain sounds, unlike the alphabet entries used for
+    // spelling. Join them without spaces to approximate one continuous word.
+    std::vector<uint8_t> stress;
+    if (!lookup("@g2p:stress", stress)) return false;
+    size_t vowel_count = std::count_if(word.begin(), word.end(), ascii_vowel);
+    const size_t stressed_vowel = config.language == "id" && vowel_count > 1
+        ? vowel_count - 2 : 0;
+    size_t vowel_index = 0;
+    for (size_t pos = 0; pos < count;) {
+        size_t size = std::min<size_t>(3, count - pos);
+        for (; size > 0; --size) {
+            std::string key = "@g2p:";
+            for (char value : word.substr(pos, size)) key.push_back(ascii_lower(value));
+            if (lookup(key, part)) break;
+        }
+        if (size == 0) {
+            ids.clear();
+            return false;
+        }
+        // Vietnamese dictionary syllables carry their own stress marker. A
+        // single word-level marker leaves later fallback syllables unmarked
+        // and can make the voice swallow the end of an unfamiliar name.
+        // Keep adjacent vowels together; Indonesian retains word-level stress.
+        const bool mark_stress = config.language == "vi"
+            ? pos == 0 || !ascii_vowel(word[pos - 1])
+            : vowel_index == stressed_vowel;
+        if (ascii_vowel(word[pos]) && mark_stress) append_ids(ids, stress);
+        for (char value : word.substr(pos, size)) vowel_index += ascii_vowel(value);
+        append_ids(ids, part);
+        pos += size;
+    }
+    return !ids.empty();
+}
+
+bool SanoFrontend::spell_word(
+    std::string_view word,
+    const SanoPiperConfig& config,
+    std::vector<uint8_t>& ids
+) const {
+    if (config.language == "en" && spell_ascii_word(word, config, ids)) {
+        return true;
+    }
+    ids.clear();
+    std::vector<uint8_t> spelled;
+    std::vector<uint8_t> part;
+    for (size_t pos = 0; pos < word.size();) {
+        // Lookup whole UTF-8 characters, never individual bytes of a letter.
+        const unsigned char lead = static_cast<unsigned char>(word[pos]);
+        size_t size = 1;
+        if (lead >= 0xc2 && lead <= 0xdf) size = 2;
+        else if (lead >= 0xe0 && lead <= 0xef) size = 3;
+        else if (lead >= 0xf0 && lead <= 0xf4) size = 4;
+        else if (lead >= 0x80) return false;
+        if (pos + size > word.size()) return false;
+        for (size_t index = 1; index < size; ++index) {
+            if ((static_cast<unsigned char>(word[pos + index]) & 0xc0) != 0x80) {
+                return false;
+            }
+        }
+        if (size == 1 && word[pos] == '\'') {
+            ++pos;
+            continue;
+        }
+        if (!lookup(word.substr(pos, size), part)) return false;
+        if (!spelled.empty() && config.space_id >= 0 && config.space_id <= 255) {
+            spelled.push_back(static_cast<uint8_t>(config.space_id));
+        }
+        append_ids(spelled, part);
+        pos += size;
+    }
+    if (spelled.empty()) return false;
+    ids = std::move(spelled);
+    return true;
+}
+
 std::string SanoFrontend::normalize(const std::string& input) const {
     std::string text = input;
     replace_all(text, "\xE2\x80\x98", "'");
@@ -568,10 +670,6 @@ SanoFrontendResult SanoFrontend::process(
         // dependency; Sano still uses its own SNL1 pronunciation table.
         V2Frontend normalizer;
         result.normalized_text = normalizer.normalize(text);
-        // The generated word list commonly contains "piper" and "lite" but
-        // not this product name. Split it before lookup instead of invoking
-        // the generic OOV letter-spelling fallback.
-        replace_word_ci(result.normalized_text, "Piperlite", "piper lite");
     } else {
         result.normalized_text = normalize(text);
     }
@@ -612,12 +710,22 @@ SanoFrontendResult SanoFrontend::process(
                 ++pos;
             }
             const std::string_view word(value.data() + begin, pos - begin);
-            if (lookup(word, ids) ||
-                (config.language == "en" && spell_ascii_word(word, config, ids))) {
+            bool pronounced = lookup(word, ids);
+            if (!pronounced) {
+                result.oov_words.emplace_back(word);
+                pronounced = pronounce_word(word, config, ids);
+                if (pronounced) {
+                    result.approximated_words.emplace_back(word);
+                } else {
+                    pronounced = spell_word(word, config, ids);
+                    if (pronounced) result.spelled_words.emplace_back(word);
+                    else result.unpronounceable_words.emplace_back(word);
+                }
+            }
+            if (pronounced) {
                 append_pending_space();
                 append_ids(result.phoneme_ids, ids);
             } else {
-                result.oov_words.emplace_back(word);
                 pending_space = !result.phoneme_ids.empty();
             }
             continue;
@@ -633,7 +741,8 @@ SanoFrontendResult SanoFrontend::process(
         ++pos;
     }
 
-    if (result.phoneme_ids.empty()) return result;
+    // A partial sentence would produce a successful but misleadingly short WAV.
+    if (!result.unpronounceable_words.empty() || result.phoneme_ids.empty()) return result;
     const size_t framed_size = 3 + result.phoneme_ids.size() * 2;
     if (framed_size > static_cast<size_t>(config.duration_max_tokens)) {
         std::fprintf(stderr,

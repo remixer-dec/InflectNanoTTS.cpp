@@ -288,6 +288,11 @@ int main(int argc, char** argv) {
         params.speaking_rate = sano_speaking_rate;
         fprintf(stderr, "Synthesizing Sano Piperlite: %s\n", text.c_str());
         const std::vector<float> audio = synth.synthesize_sano(text, params);
+        if (audio.empty()) {
+            fprintf(stderr, "Sano synthesis failed; output file not written\n");
+            Synthesizer::free_backend();
+            return 1;
+        }
         fprintf(stderr,
                 "Generated Sano %zu samples (%.2f seconds) rate=%d\n",
                 audio.size(),

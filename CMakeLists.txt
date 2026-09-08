@@ -55,31 +55,31 @@ set(INFLECT_SOURCES
     src/v2_frontend.cpp
     src/v2_model.cpp
 )
-add_executable(inflect-nano src/main.cpp ${INFLECT_SOURCES})
+add_executable(inflect-sano src/main.cpp ${INFLECT_SOURCES})
 
-target_include_directories(inflect-nano PRIVATE
+target_include_directories(inflect-sano PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
 )
 
-target_link_libraries(inflect-nano PRIVATE ggml)
+target_link_libraries(inflect-sano PRIVATE ggml)
 
-set_target_properties(inflect-nano PROPERTIES
+set_target_properties(inflect-sano PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${INFLECT_TARGET_TRIPLE}"
 )
 foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
-    set_target_properties(inflect-nano PROPERTIES
+    set_target_properties(inflect-sano PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY_${config} "${CMAKE_BINARY_DIR}/${INFLECT_TARGET_TRIPLE}"
     )
 endforeach()
 
 if(INFLECT_V2_ESPEAK_FALLBACK)
-    target_compile_definitions(inflect-nano PRIVATE INFLECT_V2_ESPEAK_FALLBACK)
+    target_compile_definitions(inflect-sano PRIVATE INFLECT_V2_ESPEAK_FALLBACK)
 endif()
 
 if(INFLECT_PROFILE_ACOUSTIC_OPS)
     target_compile_definitions(
-        inflect-nano PRIVATE INFLECT_PROFILE_ACOUSTIC_OPS=1)
+        inflect-sano PRIVATE INFLECT_PROFILE_ACOUSTIC_OPS=1)
 endif()
 
 if(BUILD_TESTING)

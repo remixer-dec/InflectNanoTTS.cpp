@@ -24,7 +24,7 @@ normalize_arch() {
 TARGET_TRIPLE="$(normalize_os "${os_name}")-$(normalize_arch "${arch_name}")"
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build/${TARGET_TRIPLE}}"
 OBJ_DIR="${BUILD_DIR}/obj"
-BIN="${BUILD_DIR}/inflect-nano"
+BIN="${BUILD_DIR}/inflect-sano"
 
 CC="${CC:-cc}"
 CXX="${CXX:-c++}"
